@@ -1,55 +1,53 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # RAM / CPU QUICK INSPECTION SCRIPT (Debian/Ubuntu Live USB)
-# Colored output + full logging + practical RAM speed test (sysbench)
+# Colored output + full logging + CLI tests + optional GUI launch (HardInfo, CPU-X)
 # ------------------------------------------------------------------------------
-# Purpose (for used RAM inspection before buying):
-#   1) Identify system + RAM configuration (including BIOS configured MT/s)
-#   2) Stress most of the RAM with verification (capacity + stability)
-#   3) Run a practical timed RAM throughput test (read/write MiB/s)
-#
-# Tools used (all via apt):
-#   - dmidecode  : SMBIOS memory info (Configured Memory Speed, module sizes)
-#   - lshw/hwinfo: secondary hardware summaries
-#   - stress-ng  : RAM stress + verification (catches fake capacity / bad ICs)
-#   - sysbench   : practical timed memory throughput test
-#
-# Requirements:
-#   - Debian/Ubuntu/Mint live USB (internet access to apt install tools)
-#   - Run as root: sudo ./ram_inspect.sh
+# What it does:
+#   0) Fix PATH to include /sbin and /usr/sbin
+#   1) Install required packages
+#   2) Launch GUI tools (optional) so you can visually inspect RAM info
+#   3) Collect identity/speed via CLI
+#   4) Stress test RAM capacity+stability (stress-ng --verify)
+#   5) Practical throughput test (sysbench memory)
+#   6) Pause between steps; log everything
 #
 # Usage:
 #   chmod +x ram_inspect.sh
 #   sudo ./ram_inspect.sh
 #
 # Notes:
-#   - XMP/EXPO must be enabled in BIOS BEFORE booting Linux if you want DDR5-6000 speed.
-#   - Some DDR5 kits do NOT expose serial via SMBIOS; "Not Specified"/"N/A" is common.
+#   - GUI launch will work only if you are in a graphical session (DISPLAY set).
+#   - CPU-X may need extra permissions; we run it with sudo.
+#   - XMP/EXPO must be enabled in BIOS for DDR5-6000 speed.
 # ==============================================================================
 
 set -Eeuo pipefail
 
-# Ensure admin tool paths exist on Live CDs (common PATH issue)
 export PATH="/sbin:/usr/sbin:/bin:/usr/bin:$PATH"
 
 # ---------------------------
-# Configuration (edit freely)
+# Configuration
 # ---------------------------
 
-# Step 2: Stress test (capacity + stability)
-VM_WORKERS="2"          # 2 is strong and usually safe on live environments
-VM_BYTES_PERCENT="90%"  # ~90% of RAM (for 64GB, around ~55-60GB)
-VERIFY_TIMEOUT="5m"     # 5 minutes catches fake capacity / major instability fast
+# Step 2: stress-ng verify
+VM_WORKERS="2"
+VM_BYTES_PERCENT="90%"
+VERIFY_TIMEOUT="5m"
 
-# Step 3: Practical throughput test (sysbench memory)
-SYSBENCH_THREADS="4"      # Throughput scaling; 4 is a good default
-SYSBENCH_BLOCK_SIZE="1M"  # 1M blocks are a good DRAM-focused size
-SYSBENCH_TOTAL_SIZE="200G" # Total data moved; practical + fast. Increase to 40G if desired.
+# Step 3: sysbench memory
+SYSBENCH_THREADS="4"
+SYSBENCH_BLOCK_SIZE="1M"
+SYSBENCH_TOTAL_SIZE="512G"   # large so it runs longer (~tens of seconds to minutes)
+
+# GUI tools (optional)
+ENABLE_GUI_TOOLS="1"         # set to "0" to disable GUI launch
+GUI_LAUNCH_SLEEP_SEC="2"     # small delay between GUI launches
 
 # Logging
 LOG_DIR="./ram_inspection_logs"
 LOG_BASENAME="ram_inspection_$(date +%Y%m%d_%H%M%S)"
-LOG_FILE=""  # assigned at runtime
+LOG_FILE=""
 
 # ---------------------------
 # Colors (safe fallback)
@@ -82,10 +80,7 @@ require_root() {
 setup_logging() {
   mkdir -p "${LOG_DIR}"
   LOG_FILE="${LOG_DIR}/${LOG_BASENAME}.log"
-
-  # Log everything (stdout+stderr) to file while still printing to terminal
   exec > >(tee -i "${LOG_FILE}") 2>&1
-
   echo "${C_DIM}Log file: ${LOG_FILE}${C_RESET}"
 }
 
@@ -107,7 +102,6 @@ warn() { echo "${C_YELLOW}${C_BOLD}[WARN]${C_RESET} $*"; }
 ok()   { echo "${C_GREEN}${C_BOLD}[ OK ]${C_RESET} $*"; }
 
 find_cmd() {
-  # Resolve command even if PATH is weird
   local cmd="$1"
   if command -v "${cmd}" >/dev/null 2>&1; then
     command -v "${cmd}"
@@ -123,7 +117,6 @@ find_cmd() {
 }
 
 run_cmd() {
-  # Run a command with clear start/end markers; keep logging even on failure
   local title="$1"; shift
   banner "${title}"
   info "Command: $*"
@@ -143,25 +136,81 @@ run_cmd() {
   return $rc
 }
 
+is_gui_session() {
+  # Minimal check: in a live desktop session, DISPLAY is usually set.
+  # WAYLAND_DISPLAY may also be set. If neither exists, we assume no GUI.
+  [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]
+}
+
+launch_gui_app_background() {
+  # Launch GUI tool in background if it exists; don't fail script if it doesn't.
+  local app="$1"
+  local title="$2"
+
+  if ! is_gui_session; then
+    warn "No GUI session detected (DISPLAY/WAYLAND_DISPLAY not set). Skipping GUI launch."
+    return 0
+  fi
+
+  if ! command -v "${app}" >/dev/null 2>&1; then
+    warn "GUI app not found: ${app}. Skipping."
+    return 0
+  fi
+
+  info "Launching GUI: ${title} (${app})"
+  # Launch in background so script can continue.
+  # Redirect stdout/stderr so the script log doesn't get spammed by GUI noise.
+  ( "${app}" >/dev/null 2>&1 & )
+  sleep "${GUI_LAUNCH_SLEEP_SEC}"
+}
+
 # ---------------------------
 # Steps
 # ---------------------------
-
 step0_install_packages() {
   banner "Step 0: Install required packages"
   info "Updating apt package lists..."
   apt-get update -y
 
-  info "Installing: stress-ng dmidecode hwinfo lshw util-linux sysbench"
-  apt-get install -y stress-ng dmidecode hwinfo lshw util-linux sysbench
+  info "Installing CLI tools: stress-ng dmidecode hwinfo lshw util-linux sysbench"
+  info "Installing GUI tools: hardinfo cpu-x gnome-system-monitor (best effort)"
+  apt-get install -y \
+    stress-ng dmidecode hwinfo lshw util-linux sysbench \
+    hardinfo cpu-x gnome-system-monitor || true
 
   echo
-  ok "Installed versions:"
+  ok "Installed versions (best effort):"
   echo "  stress-ng: $(stress-ng --version 2>/dev/null | head -n 1 || echo 'unknown')"
   echo "  dmidecode: $(dmidecode --version 2>/dev/null || echo 'unknown')"
-  echo "  hwinfo:    $(hwinfo --version 2>/dev/null | head -n 1 || echo 'unknown')"
-  echo "  lshw:      $(lshw -version 2>/dev/null || echo 'unknown')"
   echo "  sysbench:  $(sysbench --version 2>/dev/null || echo 'unknown')"
+}
+
+step0b_launch_gui_tools() {
+  banner "Step 0B: Launch GUI tools (optional)"
+  if [[ "${ENABLE_GUI_TOOLS}" != "1" ]]; then
+    warn "ENABLE_GUI_TOOLS is disabled. Skipping."
+    return 0
+  fi
+
+  if ! is_gui_session; then
+    warn "No GUI session detected. Skipping GUI tools."
+    return 0
+  fi
+
+  echo "Launching GUI tools to visually inspect RAM info:"
+  echo "  - GNOME System Monitor (watch RAM usage during stress tests)"
+  echo "  - HardInfo (hardware summary)"
+  echo "  - CPU-X (CPU-Z-like memory frequency/timings)"
+  echo
+
+  # System monitor first so you can keep it open while tests run
+  launch_gui_app_background "gnome-system-monitor" "GNOME System Monitor"
+  launch_gui_app_background "hardinfo" "HardInfo"
+  # CPU-X sometimes requires privileges to read low-level info; running as root is OK here.
+  launch_gui_app_background "cpu-x" "CPU-X"
+
+  ok "GUI tools launched (if available)."
+  echo "Tip: Keep System Monitor open during Step 2 to see RAM usage jump high."
 }
 
 step1_identity_and_speed() {
@@ -175,8 +224,6 @@ step1_identity_and_speed() {
   local dmi
   if dmi="$(find_cmd dmidecode)"; then
     run_cmd "1.3 SMBIOS Memory (dmidecode -t memory)" "${dmi}" -t memory || true
-
-    # Highlight speed lines clearly (Configured Memory Speed is the key line)
     run_cmd "1.4 Highlight RAM speed lines" bash -lc \
       "${dmi} -t memory | grep -E 'Configured Memory Speed|Speed:' || true" || true
   else
@@ -198,16 +245,15 @@ step1_identity_and_speed() {
   fi
 
   banner "What you should confirm now"
-  echo "  • Total RAM is ~64GB (see MemTotal)."
+  echo "  • Total RAM is ~64GB (MemTotal)."
   echo "  • Two DIMMs are present (dmidecode/lshw)."
-  echo "  • Configured speed shows 6000 MT/s if XMP/EXPO enabled (dmidecode lines)."
-  warn "Note: DDR5 serial may be unavailable via software; that is common."
+  echo "  • Configured speed shows 6000 MT/s if XMP/EXPO enabled."
+  warn "Note: DDR5 serial/model may not always be exposed to software."
 }
 
 step2_capacity_and_stability() {
   banner "Step 2: Capacity + stability test (stress-ng --verify)"
   echo "Allocates ~${VM_BYTES_PERCENT} of RAM, stresses patterns, and verifies correctness."
-  echo "This is the key step to catch fake capacity and unstable RAM."
   echo
 
   run_cmd "2.1 stress-ng verify test" stress-ng \
@@ -225,15 +271,12 @@ step2_capacity_and_stability() {
 
 step3_practical_speed_sysbench() {
   banner "Step 3: Practical RAM speed test (sysbench memory)"
-  echo "This is a REAL timed test: it repeatedly reads/writes memory and reports MiB/sec."
+  echo "This is a timed memory throughput test. It reports MiB/sec."
   echo
   echo "Config:"
   echo "  Threads:   ${SYSBENCH_THREADS}"
   echo "  BlockSize: ${SYSBENCH_BLOCK_SIZE}"
   echo "  TotalSize: ${SYSBENCH_TOTAL_SIZE}"
-  echo
-  echo "Tip:"
-  echo "  - If XMP/EXPO is OFF, RAM may run at JEDEC (e.g. 4800 MT/s), so throughput will be lower."
   echo
 
   run_cmd "3.1 sysbench memory WRITE throughput" sysbench memory \
@@ -251,8 +294,9 @@ step3_practical_speed_sysbench() {
     run || true
 
   banner "How to interpret Step 3"
-  echo "  - Look for lines ending with 'MiB/sec' (higher is better)."
-  echo "  - Huge drop vs expectation can indicate JEDEC speed or single-channel mode."
+  echo "  - Look for MiB/sec lines (higher is better)."
+  echo "  - If XMP/EXPO is OFF, throughput will be lower."
+  echo "  - If single-channel, throughput will be much lower."
 }
 
 final_summary() {
@@ -273,9 +317,6 @@ final_summary() {
   echo "  less -R \"${LOG_FILE}\""
 }
 
-# ---------------------------
-# Main
-# ---------------------------
 main() {
   require_root
   setup_logging
@@ -286,6 +327,9 @@ main() {
   pause
 
   step0_install_packages
+  pause
+
+  step0b_launch_gui_tools
   pause
 
   step1_identity_and_speed
