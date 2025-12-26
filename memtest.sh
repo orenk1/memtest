@@ -44,7 +44,7 @@ VERIFY_TIMEOUT="5m"     # 5 minutes catches fake capacity / major instability fa
 # Step 3: Practical throughput test (sysbench memory)
 SYSBENCH_THREADS="4"      # Throughput scaling; 4 is a good default
 SYSBENCH_BLOCK_SIZE="1M"  # 1M blocks are a good DRAM-focused size
-SYSBENCH_TOTAL_SIZE="20G" # Total data moved; practical + fast. Increase to 40G if desired.
+SYSBENCH_TOTAL_SIZE="200G" # Total data moved; practical + fast. Increase to 40G if desired.
 
 # Logging
 LOG_DIR="./ram_inspection_logs"
