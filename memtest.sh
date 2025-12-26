@@ -1,47 +1,58 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# RAM / CPU QUICK INSPECTION SCRIPT (Debian/Ubuntu Live USB) - Colored + Logging
-# + Practical RAM Speed Test (mbw)
+# RAM / CPU QUICK INSPECTION SCRIPT (Debian/Ubuntu Live USB)
+# Colored output + full logging + practical RAM speed test (sysbench)
 # ------------------------------------------------------------------------------
-# What it does:
-#   0) Adds /sbin and /usr/sbin to PATH (common on Live CDs)
-#   1) Installs required tools
-#   2) Collects memory identity + configured speed (dmidecode/lshw/hwinfo)
-#   3) Runs RAM capacity/stability test (stress-ng --vm --verify)
-#   4) Runs PRACTICAL RAM SPEED TEST (mbw) using a large buffer (default 8GB)
-#   5) Pauses between steps so you can review output
-#   6) Logs EVERYTHING to a timestamped logfile
+# Purpose (for used RAM inspection before buying):
+#   1) Identify system + RAM configuration (including BIOS configured MT/s)
+#   2) Stress most of the RAM with verification (capacity + stability)
+#   3) Run a practical timed RAM throughput test (read/write MiB/s)
+#
+# Tools used (all via apt):
+#   - dmidecode  : SMBIOS memory info (Configured Memory Speed, module sizes)
+#   - lshw/hwinfo: secondary hardware summaries
+#   - stress-ng  : RAM stress + verification (catches fake capacity / bad ICs)
+#   - sysbench   : practical timed memory throughput test
+#
+# Requirements:
+#   - Debian/Ubuntu/Mint live USB (internet access to apt install tools)
+#   - Run as root: sudo ./ram_inspect.sh
 #
 # Usage:
 #   chmod +x ram_inspect.sh
 #   sudo ./ram_inspect.sh
 #
 # Notes:
-#   - XMP/EXPO must be enabled in BIOS BEFORE booting Linux to see DDR5-6000 speeds.
-#   - Many DDR5 kits do not expose serial via SMBIOS/SPD; "N/A" is common.
+#   - XMP/EXPO must be enabled in BIOS BEFORE booting Linux if you want DDR5-6000 speed.
+#   - Some DDR5 kits do NOT expose serial via SMBIOS; "Not Specified"/"N/A" is common.
 # ==============================================================================
 
 set -Eeuo pipefail
 
-# Ensure admin paths exist in PATH (common issue on Live CDs)
+# Ensure admin tool paths exist on Live CDs (common PATH issue)
 export PATH="/sbin:/usr/sbin:/bin:/usr/bin:$PATH"
 
 # ---------------------------
 # Configuration (edit freely)
 # ---------------------------
-VM_BYTES_PERCENT="90%"       # Step 2 stress allocation percent of RAM
-VERIFY_TIMEOUT="5m"          # Step 2 duration
-VM_WORKERS="2"               # Step 2 workers (2 is strong and safer than 4 on Live CDs)
 
-MBW_SIZE_MB="8000"           # Step 3 practical speed test buffer size in MB (8000MB ~ 8GB)
-MBW_RUNS="3"                 # Repeat count for mbw
+# Step 2: Stress test (capacity + stability)
+VM_WORKERS="2"          # 2 is strong and usually safe on live environments
+VM_BYTES_PERCENT="90%"  # ~90% of RAM (for 64GB, around ~55-60GB)
+VERIFY_TIMEOUT="5m"     # 5 minutes catches fake capacity / major instability fast
 
+# Step 3: Practical throughput test (sysbench memory)
+SYSBENCH_THREADS="4"      # Throughput scaling; 4 is a good default
+SYSBENCH_BLOCK_SIZE="1M"  # 1M blocks are a good DRAM-focused size
+SYSBENCH_TOTAL_SIZE="20G" # Total data moved; practical + fast. Increase to 40G if desired.
+
+# Logging
 LOG_DIR="./ram_inspection_logs"
 LOG_BASENAME="ram_inspection_$(date +%Y%m%d_%H%M%S)"
-LOG_FILE=""                  # Assigned after LOG_DIR created
+LOG_FILE=""  # assigned at runtime
 
 # ---------------------------
-# Color helpers (safe fallback)
+# Colors (safe fallback)
 # ---------------------------
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'
@@ -59,26 +70,23 @@ else
 fi
 
 # ---------------------------
-# Logging setup
-# ---------------------------
-setup_logging() {
-  mkdir -p "${LOG_DIR}"
-  LOG_FILE="${LOG_DIR}/${LOG_BASENAME}.log"
-
-  # Tee all stdout+stderr to logfile while still printing to terminal
-  exec > >(tee -i "${LOG_FILE}") 2>&1
-
-  echo "${C_DIM}Log file: ${LOG_FILE}${C_RESET}"
-}
-
-# ---------------------------
-# Utility functions
+# Helpers
 # ---------------------------
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     echo "${C_RED}${C_BOLD}ERROR:${C_RESET} Please run as root. Example: sudo $0"
     exit 1
   fi
+}
+
+setup_logging() {
+  mkdir -p "${LOG_DIR}"
+  LOG_FILE="${LOG_DIR}/${LOG_BASENAME}.log"
+
+  # Log everything (stdout+stderr) to file while still printing to terminal
+  exec > >(tee -i "${LOG_FILE}") 2>&1
+
+  echo "${C_DIM}Log file: ${LOG_FILE}${C_RESET}"
 }
 
 pause() {
@@ -98,8 +106,8 @@ info() { echo "${C_BLUE}${C_BOLD}[INFO]${C_RESET} $*"; }
 warn() { echo "${C_YELLOW}${C_BOLD}[WARN]${C_RESET} $*"; }
 ok()   { echo "${C_GREEN}${C_BOLD}[ OK ]${C_RESET} $*"; }
 
-# Find a command path robustly (works if PATH is weird)
 find_cmd() {
+  # Resolve command even if PATH is weird
   local cmd="$1"
   if command -v "${cmd}" >/dev/null 2>&1; then
     command -v "${cmd}"
@@ -115,12 +123,12 @@ find_cmd() {
 }
 
 run_cmd() {
+  # Run a command with clear start/end markers; keep logging even on failure
   local title="$1"; shift
   banner "${title}"
   info "Command: $*"
   echo
 
-  # Run command; don't abort entire script if it fails (keep logs!)
   set +e
   "$@"
   local rc=$?
@@ -138,25 +146,27 @@ run_cmd() {
 # ---------------------------
 # Steps
 # ---------------------------
-install_packages() {
+
+step0_install_packages() {
   banner "Step 0: Install required packages"
   info "Updating apt package lists..."
   apt-get update -y
 
-  info "Installing packages: stress-ng dmidecode hwinfo lshw util-linux mbw"
-  apt-get install -y stress-ng dmidecode hwinfo lshw util-linux mbw
+  info "Installing: stress-ng dmidecode hwinfo lshw util-linux sysbench"
+  apt-get install -y stress-ng dmidecode hwinfo lshw util-linux sysbench
 
   echo
-  ok "Installed tools:"
+  ok "Installed versions:"
   echo "  stress-ng: $(stress-ng --version 2>/dev/null | head -n 1 || echo 'unknown')"
   echo "  dmidecode: $(dmidecode --version 2>/dev/null || echo 'unknown')"
   echo "  hwinfo:    $(hwinfo --version 2>/dev/null | head -n 1 || echo 'unknown')"
   echo "  lshw:      $(lshw -version 2>/dev/null || echo 'unknown')"
-  echo "  mbw:       $(mbw 2>/dev/null | head -n 1 || echo 'installed')"
+  echo "  sysbench:  $(sysbench --version 2>/dev/null || echo 'unknown')"
 }
 
-collect_identity_info() {
-  banner "Step 1: Identity / memory configuration (includes configured speed)"
+step1_identity_and_speed() {
+  banner "Step 1: Identity / RAM configuration (includes configured speed)"
+
   run_cmd "1.1 CPU info (lscpu)" lscpu || true
 
   run_cmd "1.2 Memory totals (/proc/meminfo)" bash -lc \
@@ -166,7 +176,7 @@ collect_identity_info() {
   if dmi="$(find_cmd dmidecode)"; then
     run_cmd "1.3 SMBIOS Memory (dmidecode -t memory)" "${dmi}" -t memory || true
 
-    # Highlight speed lines so they're easy to see
+    # Highlight speed lines clearly (Configured Memory Speed is the key line)
     run_cmd "1.4 Highlight RAM speed lines" bash -lc \
       "${dmi} -t memory | grep -E 'Configured Memory Speed|Speed:' || true" || true
   else
@@ -188,13 +198,13 @@ collect_identity_info() {
   fi
 
   banner "What you should confirm now"
-  echo "  • Total RAM is ~64GB (MemTotal)."
+  echo "  • Total RAM is ~64GB (see MemTotal)."
   echo "  • Two DIMMs are present (dmidecode/lshw)."
-  echo "  • Configured speed: 6000 MT/s if XMP/EXPO enabled (dmidecode speed lines)."
+  echo "  • Configured speed shows 6000 MT/s if XMP/EXPO enabled (dmidecode lines)."
   warn "Note: DDR5 serial may be unavailable via software; that is common."
 }
 
-run_stress_verify() {
+step2_capacity_and_stability() {
   banner "Step 2: Capacity + stability test (stress-ng --verify)"
   echo "Allocates ~${VM_BYTES_PERCENT} of RAM, stresses patterns, and verifies correctness."
   echo "This is the key step to catch fake capacity and unstable RAM."
@@ -208,31 +218,41 @@ run_stress_verify() {
     --timeout "${VERIFY_TIMEOUT}" \
     --metrics-brief || true
 
-  banner "How to interpret"
+  banner "How to interpret Step 2"
   echo "  ✅ PASS: completes with no 'fail/error' lines."
   echo "  ❌ FAIL: any verify errors, crashes, or reboots → do not buy."
 }
 
-run_practical_speed_test_mbw() {
-  banner "Step 3: Practical RAM SPEED test (mbw)"
-  echo "This is a REAL timing test: it allocates a large buffer and measures copy/read/write throughput."
+step3_practical_speed_sysbench() {
+  banner "Step 3: Practical RAM speed test (sysbench memory)"
+  echo "This is a REAL timed test: it repeatedly reads/writes memory and reports MiB/sec."
   echo
   echo "Config:"
-  echo "  - Buffer size: ${MBW_SIZE_MB} MB"
-  echo "  - Runs:        ${MBW_RUNS}"
+  echo "  Threads:   ${SYSBENCH_THREADS}"
+  echo "  BlockSize: ${SYSBENCH_BLOCK_SIZE}"
+  echo "  TotalSize: ${SYSBENCH_TOTAL_SIZE}"
   echo
-  echo "Command:"
-  echo "  mbw -n ${MBW_RUNS} -t ${MBW_SIZE_MB}"
+  echo "Tip:"
+  echo "  - If XMP/EXPO is OFF, RAM may run at JEDEC (e.g. 4800 MT/s), so throughput will be lower."
   echo
 
-  # mbw writes/reads/copies a large region, producing MiB/s output.
-  # It's a clean 'practical throughput' number and easy to compare between systems.
-  run_cmd "3.1 mbw speed test" mbw -n "${MBW_RUNS}" -t "${MBW_SIZE_MB}" || true
+  run_cmd "3.1 sysbench memory WRITE throughput" sysbench memory \
+    --memory-block-size="${SYSBENCH_BLOCK_SIZE}" \
+    --memory-total-size="${SYSBENCH_TOTAL_SIZE}" \
+    --memory-oper=write \
+    --threads="${SYSBENCH_THREADS}" \
+    run || true
 
-  banner "How to interpret"
-  echo "  - Look at the AVG lines (MiB/s). Higher is better."
-  echo "  - If XMP/EXPO is OFF (e.g., 4800 MT/s), numbers will be lower."
-  echo "  - If the kit is running single-channel, numbers will be much lower."
+  run_cmd "3.2 sysbench memory READ throughput" sysbench memory \
+    --memory-block-size="${SYSBENCH_BLOCK_SIZE}" \
+    --memory-total-size="${SYSBENCH_TOTAL_SIZE}" \
+    --memory-oper=read \
+    --threads="${SYSBENCH_THREADS}" \
+    run || true
+
+  banner "How to interpret Step 3"
+  echo "  - Look for lines ending with 'MiB/sec' (higher is better)."
+  echo "  - Huge drop vs expectation can indicate JEDEC speed or single-channel mode."
 }
 
 final_summary() {
@@ -242,8 +262,8 @@ final_summary() {
   echo "${C_BOLD}Buy / Don't Buy quick rule:${C_RESET}"
   echo "  ✅ BUY if:"
   echo "     - Total RAM ~64GB"
-  echo "     - stress-ng verify test shows ZERO errors"
-  echo "     - mbw completes cleanly and throughput looks reasonable"
+  echo "     - Step 2 stress-ng verify shows ZERO errors"
+  echo "     - Step 3 sysbench completes cleanly with reasonable MiB/sec"
   echo
   echo "  ❌ DON'T BUY if:"
   echo "     - Any stress-ng verification errors"
@@ -253,25 +273,28 @@ final_summary() {
   echo "  less -R \"${LOG_FILE}\""
 }
 
+# ---------------------------
+# Main
+# ---------------------------
 main() {
   require_root
   setup_logging
 
   banner "RAM Inspection Script - START"
-  info "Running on: $(date)"
+  info "Date: $(date)"
   info "PATH: ${PATH}"
   pause
 
-  install_packages
+  step0_install_packages
   pause
 
-  collect_identity_info
+  step1_identity_and_speed
   pause
 
-  run_stress_verify
+  step2_capacity_and_stability
   pause
 
-  run_practical_speed_test_mbw
+  step3_practical_speed_sysbench
   pause
 
   final_summary
