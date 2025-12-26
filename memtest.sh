@@ -218,9 +218,11 @@ run_bandwidth_stream() {
   echo
 
   run_cmd "3.1 stress-ng stream test" stress-ng \
-    --vm "${VM_WORKERS}" \
-    --vm-bytes 8G \
+    --vm 2 \
+    --vm-bytes 90% \
     --timeout "${STREAM_TIMEOUT}" \
+    --vm-method all \
+    --verify \
     --metrics-brief || true
 
   banner "How to interpret"
