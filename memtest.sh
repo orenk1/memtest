@@ -220,7 +220,6 @@ run_bandwidth_stream() {
   run_cmd "3.1 stress-ng stream test" stress-ng \
     --vm "${VM_WORKERS}" \
     --vm-bytes 8G \
-    --vm-method stream \
     --timeout "${STREAM_TIMEOUT}" \
     --metrics-brief || true
 
