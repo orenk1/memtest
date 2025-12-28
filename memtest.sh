@@ -474,14 +474,16 @@ step2b_memtester_random_fast() {
 }
 
 # ---------------------------
-# Step 3: fio RAM bandwidth test (precompiled, MiB/s output)
+# Step 3: fio RAM-like bandwidth test (tmpfs /dev/shm)
 # ---------------------------
-compute_fio_size_gib() {
-  # Compute fio buffer size in GiB based on MemAvailable.
-  # fio will allocate this much RAM for the memory engine.
+
+compute_fio_tmpfs_size_gib() {
+  # Compute a safe tmpfs workload size based on MemAvailable.
   #
-  # We choose: size_gib = MemAvailable * percent / 100
-  # Then clamp to [FIO_MIN_SIZE_GB, FIO_MAX_SIZE_GB]
+  # Why:
+  #   - /dev/shm is tmpfs (RAM-backed), so writing/reading there is effectively
+  #     a RAM throughput test (with some kernel overhead).
+  #   - We intentionally use a BIG file and 1M blocks to reduce cache illusions.
   #
   # Returns a string like "8G".
   local mem_avail_kb mem_avail_gib raw_gib size_gib
@@ -495,7 +497,7 @@ compute_fio_size_gib() {
   # Convert kB -> GiB (integer)
   mem_avail_gib=$(( mem_avail_kb / 1024 / 1024 ))
 
-  # Compute percentage of available GiB (integer)
+  # Take a percentage of MemAvailable (integer math)
   raw_gib=$(( mem_avail_gib * FIO_ARRAY_PERCENT / 100 ))
 
   # Clamp
@@ -507,7 +509,7 @@ compute_fio_size_gib() {
 }
 
 step3_fio_ram_bandwidth() {
-  banner "Step 3: RAM throughput test (fio ioengine=memory, MiB/s output)"
+  banner "Step 3: RAM throughput test (fio on tmpfs /dev/shm) - MiB/s output"
 
   local fio_bin
   fio_bin="$(find_cmd fio)" || {
@@ -515,49 +517,73 @@ step3_fio_ram_bandwidth() {
     return 0
   }
 
-  local fio_size
-  fio_size="$(compute_fio_size_gib)"
+  # Safety: ensure /dev/shm exists and is tmpfs
+  if [[ ! -d "/dev/shm" ]]; then
+    warn "/dev/shm not found. Skipping Step 3."
+    return 0
+  fi
 
-  echo "fio configuration:"
-  echo "  ioengine:   memory (RAM-only)"
-  echo "  size:       ${fio_size} (buffer size)"
-  echo "  bs:         ${FIO_BS}"
-  echo "  numjobs:    ${FIO_NUMJOBS}"
-  echo "  runtime:    ${FIO_RUNTIME_SEC}s"
+  local fio_size
+  fio_size="$(compute_fio_tmpfs_size_gib)"
+
+  # Use a unique filename in tmpfs
+  local fio_file="/dev/shm/fio_ram_test_${$}.bin"
+
+  echo "fio tmpfs configuration:"
+  echo "  location:  /dev/shm (tmpfs, RAM-backed)"
+  echo "  file:      ${fio_file}"
+  echo "  size:      ${fio_size}"
+  echo "  bs:        ${FIO_BS}"
+  echo "  numjobs:   ${FIO_NUMJOBS}"
+  echo "  runtime:   ${FIO_RUNTIME_SEC}s"
   echo
   echo "Output to watch:"
   echo "  READ:  bw=XXXXXMiB/s"
   echo "  WRITE: bw=XXXXXMiB/s"
   echo
+  warn "Note: This measures tmpfs throughput (RAM-backed) with some kernel overhead."
+  warn "It's still GREAT for comparing DIMM A vs DIMM B on the same system."
+  echo
 
-  # We run two jobs: one read and one write, sequentially, for easy interpretation.
-  run_cmd "3.1 fio WRITE bandwidth" "${fio_bin}" \
-    --name=ram_write \
-    --ioengine=memory \
+  # --- WRITE test: sequential writes into tmpfs ---
+  run_cmd "3.1 fio tmpfs WRITE bandwidth" "${fio_bin}" \
+    --name=tmpfs_write \
+    --filename="${fio_file}" \
+    --ioengine=sync \
     --rw=write \
-    --size="${fio_size}" \
     --bs="${FIO_BS}" \
+    --size="${fio_size}" \
     --numjobs="${FIO_NUMJOBS}" \
     --runtime="${FIO_RUNTIME_SEC}" \
     --time_based \
-    --group_reporting || true
+    --group_reporting \
+    --overwrite=1 \
+    --fsync=0 \
+    --direct=0 || true
 
-  run_cmd "3.2 fio READ bandwidth" "${fio_bin}" \
-    --name=ram_read \
-    --ioengine=memory \
+  # --- READ test: sequential reads from the same tmpfs file ---
+  run_cmd "3.2 fio tmpfs READ bandwidth" "${fio_bin}" \
+    --name=tmpfs_read \
+    --filename="${fio_file}" \
+    --ioengine=sync \
     --rw=read \
-    --size="${fio_size}" \
     --bs="${FIO_BS}" \
+    --size="${fio_size}" \
     --numjobs="${FIO_NUMJOBS}" \
     --runtime="${FIO_RUNTIME_SEC}" \
     --time_based \
-    --group_reporting || true
+    --group_reporting \
+    --direct=0 || true
+
+  # Cleanup tmpfs file (don’t leave big RAM files around)
+  rm -f "${fio_file}" || true
 
   banner "Interpretation"
-  echo "  • Compare the MiB/s numbers between DIMMs under the same BIOS settings."
-  echo "  • With ONE DIMM installed, expect single-channel bandwidth (lower than dual-DIMM)."
-  echo "  • Big deviations (30%+) between similar DIMMs are suspicious."
+  echo "  • Compare the MiB/s numbers between DIMMs under the SAME BIOS settings."
+  echo "  • With ONE DIMM installed, expect single-channel bandwidth."
+  echo "  • If one stick is ~30%+ slower than the other with same settings → suspicious."
 }
+
 
 final_summary() {
   banner "Final Summary"
