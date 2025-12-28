@@ -486,8 +486,8 @@ step2_stressng_verify() {
 # ---------------------------
 # Step 2B: memtester address-space proof (anti-fake)
 # ---------------------------
-step2b_memtester_address_check() {
-  banner "Step 2B: Address-space proof test (memtester)"
+step2b_memtester_random_fast() {
+  banner "Step 2B: Fast random address-space test (memtester, time-bounded)"
 
   local memtester_bin
   memtester_bin="$(find_cmd memtester)" || {
@@ -495,36 +495,45 @@ step2b_memtester_address_check() {
     return 0
   }
 
-  # Compute a safe amount of RAM in MB from MemAvailable:
-  # - MemAvailable is in kB
-  # - Convert to MB and multiply by MEMTESTER_PERCENT/100
-  local mem_avail_kb mem_to_test_mb
+  # Read MemAvailable (kB)
+  local mem_avail_kb
   mem_avail_kb="$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
-  if [[ -z "${mem_avail_kb}" || "${mem_avail_kb}" -le 0 ]]; then
-    warn "Could not read MemAvailable from /proc/meminfo. Skipping memtester."
-    return 0
+
+  # Use a fixed chunk instead of full RAM:
+  #  - 16–24 GB is enough to detect fake 32 GB modules
+  local mem_to_test_mb
+  mem_to_test_mb=$(( mem_avail_kb / 1024 / 2 ))   # ~50% of available RAM
+
+  # Cap the size to keep runtime predictable
+  if [[ "${mem_to_test_mb}" -gt 24576 ]]; then
+    mem_to_test_mb="24576"   # 24 GB cap
   fi
 
-  mem_to_test_mb="$(( (mem_avail_kb / 1024) * MEMTESTER_PERCENT / 100 ))"
-
-  # Ensure we don't pass an absurdly small or zero value.
-  if [[ "${mem_to_test_mb}" -lt 256 ]]; then
-    warn "Computed memtester size is too small (${mem_to_test_mb} MB). Skipping."
-    return 0
+  # Ensure minimum meaningful size
+  if [[ "${mem_to_test_mb}" -lt 8192 ]]; then
+    mem_to_test_mb="8192"    # 8 GB minimum
   fi
 
-  echo "This test is excellent at detecting counterfeit/mirrored RAM."
-  echo "Config:"
-  echo "  MemAvailable: ${mem_avail_kb} kB"
-  echo "  memtester MB: ${mem_to_test_mb} MB (~${MEMTESTER_PERCENT}% of MemAvailable)"
-  echo "  Passes:       ${MEMTESTER_PASSES}"
+  # Hard wall-clock limit
+  local TIME_LIMIT="7m"
+
+  echo "Fast counterfeit-detection configuration:"
+  echo "  Memory tested: ${mem_to_test_mb} MB"
+  echo "  Passes:        unlimited (time-limited)"
+  echo "  Time limit:    ${TIME_LIMIT}"
+  echo
+  echo "This uses RANDOMIZED address patterns and is sufficient for fake RAM detection."
   echo
 
-  run_cmd "2B.1 memtester run" "${memtester_bin}" "${mem_to_test_mb}" "${MEMTESTER_PASSES}" || true
+  run_cmd "2B.1 memtester (random, time-limited)" \
+    timeout "${TIME_LIMIT}" \
+    "${memtester_bin}" "${mem_to_test_mb}" 9999 || true
 
   banner "Interpretation"
-  echo "  ✅ PASS: no errors"
-  echo "  ❌ FAIL: ANY error strongly suggests fake/defective memory"
+  echo "  ✅ PASS: no errors before timeout"
+  echo "  ❌ FAIL: ANY error = fake or defective RAM"
+  echo
+  warn "Timeout exit code is expected and OK."
 }
 
 # ---------------------------
