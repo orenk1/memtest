@@ -261,7 +261,6 @@ step0_install_packages() {
   # Optional GUI tools (best effort)
   local gui_pkgs=(
     gnome-system-monitor
-    hardinfo
     cpu-x
   )
 
@@ -297,12 +296,10 @@ step0b_launch_gui_tools() {
 
   echo "Launching GUI tools to visually inspect RAM info:"
   echo "  - GNOME System Monitor (watch RAM usage during tests)"
-  echo "  - HardInfo (hardware summary) [may be unavailable]"
   echo "  - CPU-X (CPU-Z-like memory frequency/timings) [may be unavailable]"
   echo
 
   launch_gui_app_background "gnome-system-monitor" "GNOME System Monitor"
-  launch_gui_app_background "hardinfo" "HardInfo"
   launch_gui_app_background "cpu-x" "CPU-X"
 
   ok "GUI tools launched (if available)."
