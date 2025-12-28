@@ -4,22 +4,21 @@
 # ------------------------------------------------------------------------------
 # Purpose:
 #   Verify a used RAM DIMM is legit (real capacity, stable, sane SPD, meaningful
-#   sustained bandwidth). Designed for testing ONE DIMM at a time.
+#   sustained memory throughput). Designed for testing ONE DIMM at a time.
 #
 # Key tests:
-#   - Slot-level DIMM validation (dmidecode): proves how BIOS reports the stick
-#   - stress-ng --verify: correctness under heavy load (strong counterfeit detector)
-#   - memtester (time-limited, percent-based): random-ish patterns + address sanity
-#   - STREAM benchmark (classic Copy/Scale/Add/Triad): meaningful RAM bandwidth
-#
-# IMPORTANT FIX:
-#   Fedora may already have a different program named "stream" that requires args.
-#   This script NEVER calls "stream". It ALWAYS compiles the classic STREAM
-#   benchmark from stream.c and runs it as ./stream_bench to avoid collisions.
+#   - Slot-level DIMM validation (dmidecode): BIOS/SMBIOS reported size/fields
+#   - stress-ng --verify: correctness under heavy RAM load (very strong detector)
+#   - memtester (time-limited, percent-based): additional address/pattern coverage
+#   - fio (ioengine=memory): reports real READ/WRITE bandwidth in MiB/s (prebuilt)
 #
 # Usage:
 #   chmod +x ram_inspect_fedora43.sh
 #   sudo ./ram_inspect_fedora43.sh
+#
+# Notes:
+#   - If SMBIOS fields are blank, that's often normal. Real proof is Step 2 + 2B.
+#   - One DIMM => single-channel bandwidth. Compare sticks under same settings.
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -29,28 +28,29 @@ export PATH="/sbin:/usr/sbin:/bin:/usr/bin:$PATH"
 # Configuration (tune here)
 # ---------------------------
 
-# You can change this per run:
-# - Today you test 16GB: set EXPECTED_DIMM_SIZE_GB="16"
-# - Tomorrow you test 32GB: set EXPECTED_DIMM_SIZE_GB="32"
+# Change per run if you want SMBIOS "hint" checking:
+# - For a 16GB stick: EXPECTED_DIMM_SIZE_GB="16"
+# - For a 32GB stick: EXPECTED_DIMM_SIZE_GB="32"
 EXPECTED_DIMM_COUNT="1"
 EXPECTED_DIMM_SIZE_GB="32"
 
 # stress-ng verify (stability / correctness)
 VM_WORKERS="2"
-VM_BYTES_PERCENT="85%"         # safer than 90% on desktop systems
-VERIFY_TIMEOUT="7m"            # increase to 10–20m for more confidence
+VM_BYTES_PERCENT="85%"
+VERIFY_TIMEOUT="7m"
 
 # memtester (fast, time-limited, percent-based)
-MEMTESTER_PERCENT="85"         # % of MemAvailable to lock
-MEMTESTER_PASSES="9999"        # huge; we stop via timeout
-MEMTESTER_TIME_LIMIT="7m"      # target 5–7 minutes
+MEMTESTER_PERCENT="85"          # % of MemAvailable to lock
+MEMTESTER_PASSES="9999"         # huge; we stop via timeout
+MEMTESTER_TIME_LIMIT="7m"       # target 5–7 minutes
 
-# STREAM (classic benchmark)
-STREAM_OMP_THREADS="4"         # 1 DIMM => single-channel; threads still help saturate
-STREAM_TIME_LIMIT="2m"         # STREAM is usually quick; this is just a guard
-STREAM_WORKDIR="./stream_build"
-STREAM_MIN_ARRAY_MB="1024"     # arrays must exceed cache (at least ~1GB total footprint)
-STREAM_MAX_ARRAY_MB_PERCENT="35"  # cap total STREAM footprint to % of MemAvailable (safety)
+# fio RAM bandwidth test (ioengine=memory) - produces MiB/s output
+FIO_RUNTIME_SEC="90"            # 60–120 sec is good
+FIO_BS="1M"                     # block size
+FIO_NUMJOBS="2"                 # worker jobs
+FIO_ARRAY_PERCENT="50"          # % of MemAvailable to allocate for fio buffer
+FIO_MIN_SIZE_GB="4"             # minimum buffer size (GiB)
+FIO_MAX_SIZE_GB="12"            # maximum buffer size (GiB) -> keeps runtime + pressure sane
 
 # GUI tools (optional)
 ENABLE_GUI_TOOLS="1"
@@ -83,7 +83,6 @@ fi
 # Helpers
 # ---------------------------
 require_root() {
-  # dmidecode + installs require root.
   if [[ "${EUID}" -ne 0 ]]; then
     echo "${C_RED}${C_BOLD}ERROR:${C_RESET} Please run as root. Example: sudo $0"
     exit 1
@@ -136,7 +135,6 @@ run_cmd() {
   info "Command: $*"
   echo
 
-  # Don't kill the whole script on one command failure
   set +e
   "$@"
   local rc=$?
@@ -178,7 +176,6 @@ launch_gui_app_background() {
 # Fedora / DNF helpers
 # ---------------------------
 dnf_install_if_missing() {
-  # Install packages only if not already installed.
   local pkgs=("$@")
   local to_install=()
 
@@ -200,7 +197,6 @@ dnf_install_if_missing() {
 }
 
 dnf_enable_rpmfusion_if_possible() {
-  # CPU-X is sometimes easier to get with RPM Fusion.
   banner "Fedora: Optional RPM Fusion enable (best effort)"
   info "Trying to enable RPM Fusion (free + nonfree) to improve tool availability..."
   echo
@@ -233,8 +229,7 @@ step0_install_packages() {
   info "Refreshing DNF metadata again..."
   dnf makecache -y || true
 
-  # Core CLI tools (required)
-  # - curl/wget: used to download stream.c automatically if network is available
+  # Core CLI tools
   local cli_pkgs=(
     stress-ng
     dmidecode
@@ -242,10 +237,7 @@ step0_install_packages() {
     lshw
     util-linux
     memtester
-    gcc
-    make
-    curl
-    wget
+    fio
   )
 
   info "Installing CLI packages..."
@@ -271,7 +263,7 @@ step0_install_packages() {
   echo "  stress-ng: $(stress-ng --version 2>/dev/null | head -n 1 || echo 'unknown')"
   echo "  dmidecode: $(dmidecode --version 2>/dev/null || echo 'unknown')"
   echo "  memtester: $(memtester 2>/dev/null | head -n 1 || echo 'unknown')"
-  echo "  gcc:       $(gcc --version 2>/dev/null | head -n 1 || echo 'unknown')"
+  echo "  fio:       $(fio --version 2>/dev/null || echo 'unknown')"
 }
 
 # ---------------------------
@@ -462,9 +454,7 @@ step2b_memtester_random_fast() {
   mem_avail_mb=$(( mem_avail_kb / 1024 ))
   mem_to_test_mb=$(( mem_avail_mb * MEMTESTER_PERCENT / 100 ))
 
-  # Safety bounds:
-  # - Minimum ensures the test is still meaningful.
-  # - Maximum keeps runtime in your 5–7 minute range on bigger RAM machines.
+  # Safety bounds
   if [[ "${mem_to_test_mb}" -lt 6144 ]]; then mem_to_test_mb=6144; fi
   if [[ "${mem_to_test_mb}" -gt 26624 ]]; then mem_to_test_mb=26624; fi
 
@@ -484,109 +474,89 @@ step2b_memtester_random_fast() {
 }
 
 # ---------------------------
-# STREAM helpers (classic benchmark)
+# Step 3: fio RAM bandwidth test (precompiled, MiB/s output)
 # ---------------------------
-stream_download_stream_c() {
-  # Download the classic STREAM source file (stream.c).
-  # If your machine has no network, you can manually place stream.c in STREAM_WORKDIR.
-  local url="https://raw.githubusercontent.com/jeffhammond/STREAM/master/stream.c"
-  local out="$1"
-
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "${url}" -o "${out}"
-    return 0
-  fi
-  if command -v wget >/dev/null 2>&1; then
-    wget -qO "${out}" "${url}"
-    return 0
-  fi
-  return 1
-}
-
-stream_compute_array_size() {
-  # STREAM uses 3 arrays (a,b,c) of doubles by default.
-  # Total bytes ~ 3 * N * 8 = 24*N.
+compute_fio_size_gib() {
+  # Compute fio buffer size in GiB based on MemAvailable.
+  # fio will allocate this much RAM for the memory engine.
   #
-  # We choose a total footprint based on MemAvailable:
-  #   total_mb = max(STREAM_MIN_ARRAY_MB, MemAvailable * STREAM_MAX_ARRAY_MB_PERCENT%)
+  # We choose: size_gib = MemAvailable * percent / 100
+  # Then clamp to [FIO_MIN_SIZE_GB, FIO_MAX_SIZE_GB]
   #
-  # Then N = total_bytes / 24.
-  local mem_avail_kb mem_avail_mb max_total_mb target_total_mb total_bytes n
+  # Returns a string like "8G".
+  local mem_avail_kb mem_avail_gib raw_gib size_gib
 
   mem_avail_kb="$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
-  mem_avail_mb=$(( mem_avail_kb / 1024 ))
-
-  max_total_mb=$(( mem_avail_mb * STREAM_MAX_ARRAY_MB_PERCENT / 100 ))
-  target_total_mb="${max_total_mb}"
-
-  if [[ "${target_total_mb}" -lt "${STREAM_MIN_ARRAY_MB}" ]]; then
-    target_total_mb="${STREAM_MIN_ARRAY_MB}"
-  fi
-
-  total_bytes=$(( target_total_mb * 1024 * 1024 ))
-  n=$(( total_bytes / 24 ))
-
-  if [[ "${n}" -lt 1 ]]; then n=1; fi
-  echo "${n}"
-}
-
-# ---------------------------
-# Step 3: STREAM benchmark (collision-proof)
-# ---------------------------
-step3_stream_bandwidth() {
-  banner "Step 3: STREAM benchmark (classic Copy/Scale/Add/Triad) - collision-proof"
-
-  mkdir -p "${STREAM_WORKDIR}"
-  local cfile="${STREAM_WORKDIR}/stream.c"
-  local outbin="${STREAM_WORKDIR}/stream_bench"
-
-  # Ensure we have stream.c
-  if [[ ! -f "${cfile}" ]]; then
-    info "Downloading classic STREAM source to: ${cfile}"
-    if ! stream_download_stream_c "${cfile}"; then
-      fail "Could not download STREAM.c (no curl/wget or no network)."
-      echo "Workaround (manual):"
-      echo "  1) Download stream.c from the STREAM GitHub repo on another machine"
-      echo "  2) Copy it to: ${cfile}"
-      echo "  3) Re-run the script"
-      return 0
-    fi
-  else
-    info "Using existing source: ${cfile}"
-  fi
-
-  # Compute a safe array size
-  local n
-  n="$(stream_compute_array_size)"
-
-  info "Computed STREAM_ARRAY_SIZE (N): ${n}"
-  info "OMP_NUM_THREADS: ${STREAM_OMP_THREADS}"
-  echo
-
-  # Compile STREAM into a uniquely named local binary to avoid collisions with any "stream" command.
-  run_cmd "3.1 Compile STREAM benchmark (stream_bench)" gcc -O3 -fopenmp \
-    -DSTREAM_ARRAY_SIZE="${n}" \
-    -DNTIMES=10 \
-    -o "${outbin}" "${cfile}" || true
-
-  if [[ ! -x "${outbin}" ]]; then
-    fail "STREAM compile failed. Check output above."
+  if [[ -z "${mem_avail_kb}" || "${mem_avail_kb}" -le 0 ]]; then
+    echo "${FIO_MIN_SIZE_GB}G"
     return 0
   fi
 
-  banner "Running STREAM benchmark"
-  echo "Expected output includes: Copy / Scale / Add / Triad"
-  echo "OMP threads: ${STREAM_OMP_THREADS}"
-  echo "Time limit:  ${STREAM_TIME_LIMIT}"
+  # Convert kB -> GiB (integer)
+  mem_avail_gib=$(( mem_avail_kb / 1024 / 1024 ))
+
+  # Compute percentage of available GiB (integer)
+  raw_gib=$(( mem_avail_gib * FIO_ARRAY_PERCENT / 100 ))
+
+  # Clamp
+  size_gib="${raw_gib}"
+  if [[ "${size_gib}" -lt "${FIO_MIN_SIZE_GB}" ]]; then size_gib="${FIO_MIN_SIZE_GB}"; fi
+  if [[ "${size_gib}" -gt "${FIO_MAX_SIZE_GB}" ]]; then size_gib="${FIO_MAX_SIZE_GB}"; fi
+
+  echo "${size_gib}G"
+}
+
+step3_fio_ram_bandwidth() {
+  banner "Step 3: RAM throughput test (fio ioengine=memory, MiB/s output)"
+
+  local fio_bin
+  fio_bin="$(find_cmd fio)" || {
+    warn "fio not found. Skipping Step 3."
+    return 0
+  }
+
+  local fio_size
+  fio_size="$(compute_fio_size_gib)"
+
+  echo "fio configuration:"
+  echo "  ioengine:   memory (RAM-only)"
+  echo "  size:       ${fio_size} (buffer size)"
+  echo "  bs:         ${FIO_BS}"
+  echo "  numjobs:    ${FIO_NUMJOBS}"
+  echo "  runtime:    ${FIO_RUNTIME_SEC}s"
+  echo
+  echo "Output to watch:"
+  echo "  READ:  bw=XXXXXMiB/s"
+  echo "  WRITE: bw=XXXXXMiB/s"
   echo
 
-  run_cmd "3.2 Run STREAM benchmark" bash -lc \
-    "export OMP_NUM_THREADS='${STREAM_OMP_THREADS}'; timeout '${STREAM_TIME_LIMIT}' '${outbin}'" || true
+  # We run two jobs: one read and one write, sequentially, for easy interpretation.
+  run_cmd "3.1 fio WRITE bandwidth" "${fio_bin}" \
+    --name=ram_write \
+    --ioengine=memory \
+    --rw=write \
+    --size="${fio_size}" \
+    --bs="${FIO_BS}" \
+    --numjobs="${FIO_NUMJOBS}" \
+    --runtime="${FIO_RUNTIME_SEC}" \
+    --time_based \
+    --group_reporting || true
+
+  run_cmd "3.2 fio READ bandwidth" "${fio_bin}" \
+    --name=ram_read \
+    --ioengine=memory \
+    --rw=read \
+    --size="${fio_size}" \
+    --bs="${FIO_BS}" \
+    --numjobs="${FIO_NUMJOBS}" \
+    --runtime="${FIO_RUNTIME_SEC}" \
+    --time_based \
+    --group_reporting || true
 
   banner "Interpretation"
-  echo "  • Focus on the 'Triad' bandwidth (MB/s)."
-  echo "  • Compare DIMMs under the same BIOS settings; results should be close (±10–15%)."
-  echo "  • With only ONE DIMM installed, you should expect single-channel bandwidth."
+  echo "  • Compare the MiB/s numbers between DIMMs under the same BIOS settings."
+  echo "  • With ONE DIMM installed, expect single-channel bandwidth (lower than dual-DIMM)."
+  echo "  • Big deviations (30%+) between similar DIMMs are suspicious."
 }
 
 final_summary() {
@@ -597,7 +567,7 @@ final_summary() {
   echo "  ✅ BUY if:"
   echo "     - stress-ng verify shows ZERO errors"
   echo "     - memtester shows ZERO errors"
-  echo "     - STREAM output prints Copy/Scale/Add/Triad and looks consistent vs other DIMM"
+  echo "     - fio READ/WRITE MiB/s looks consistent vs your other DIMM"
   echo
   echo "  ❌ DON'T BUY if:"
   echo "     - Any stress-ng verify errors"
@@ -622,8 +592,7 @@ main() {
   echo "  - Expected DIMM size hint (SMBIOS): ${EXPECTED_DIMM_SIZE_GB} GB"
   echo
   echo "Tip:"
-  echo "  - For a 16GB stick today: set EXPECTED_DIMM_SIZE_GB=\"16\" at top and rerun."
-  echo
+  echo "  - For a 16GB stick: set EXPECTED_DIMM_SIZE_GB=\"16\" at top and rerun."
   pause
 
   step0_install_packages
@@ -647,7 +616,7 @@ main() {
   step2b_memtester_random_fast
   pause
 
-  step3_stream_bandwidth
+  step3_fio_ram_bandwidth
   pause
 
   final_summary
