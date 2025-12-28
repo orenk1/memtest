@@ -630,7 +630,7 @@ main() {
   step2_stressng_verify
   pause
 
-  step2b_memtester_address_check
+  step2b_memtester_address_fast
   pause
 
   step3_sysbench_throughput
