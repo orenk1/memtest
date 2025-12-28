@@ -2,14 +2,20 @@
 # ==============================================================================
 # RAM / CPU QUICK INSPECTION SCRIPT (Fedora Desktop 43 / Fedora Workstation)
 # ------------------------------------------------------------------------------
-# Focus: Validate used RAM DIMM legitimacy (capacity + stability + bandwidth)
-# Testing: ONE DIMM AT A TIME (your motherboard limitation)
+# Purpose:
+#   Verify a used RAM DIMM is legit (real capacity, stable, sane SPD, meaningful
+#   sustained bandwidth). Designed for testing ONE DIMM at a time.
 #
-# Includes:
-#   - Slot-level DIMM validation (dmidecode)
-#   - stress-ng verify
-#   - memtester (time-limited, percentage-based)
-#   - STREAM benchmark (preferred over sysbench for real memory bandwidth)
+# Key tests:
+#   - Slot-level DIMM validation (dmidecode): proves how BIOS reports the stick
+#   - stress-ng --verify: correctness under heavy load (strong counterfeit detector)
+#   - memtester (time-limited, percent-based): random-ish patterns + address sanity
+#   - STREAM benchmark (classic Copy/Scale/Add/Triad): meaningful RAM bandwidth
+#
+# IMPORTANT FIX:
+#   Fedora may already have a different program named "stream" that requires args.
+#   This script NEVER calls "stream". It ALWAYS compiles the classic STREAM
+#   benchmark from stream.c and runs it as ./stream_bench to avoid collisions.
 #
 # Usage:
 #   chmod +x ram_inspect_fedora43.sh
@@ -23,25 +29,28 @@ export PATH="/sbin:/usr/sbin:/bin:/usr/bin:$PATH"
 # Configuration (tune here)
 # ---------------------------
 
+# You can change this per run:
+# - Today you test 16GB: set EXPECTED_DIMM_SIZE_GB="16"
+# - Tomorrow you test 32GB: set EXPECTED_DIMM_SIZE_GB="32"
 EXPECTED_DIMM_COUNT="1"
-EXPECTED_DIMM_SIZE_GB="32"          # you will test 16GB today, 32GB tomorrow -> you can edit per run
+EXPECTED_DIMM_SIZE_GB="32"
 
-# stress-ng verify
+# stress-ng verify (stability / correctness)
 VM_WORKERS="2"
-VM_BYTES_PERCENT="85%"
-VERIFY_TIMEOUT="7m"
+VM_BYTES_PERCENT="85%"         # safer than 90% on desktop systems
+VERIFY_TIMEOUT="7m"            # increase to 10–20m for more confidence
 
 # memtester (fast, time-limited, percent-based)
-MEMTESTER_PERCENT="85"              # % of MemAvailable to lock
-MEMTESTER_PASSES="9999"             # huge; we time-limit with timeout
-MEMTESTER_TIME_LIMIT="7m"           # target 5–7 minutes
+MEMTESTER_PERCENT="85"         # % of MemAvailable to lock
+MEMTESTER_PASSES="9999"        # huge; we stop via timeout
+MEMTESTER_TIME_LIMIT="7m"      # target 5–7 minutes
 
-# STREAM benchmark
-STREAM_OMP_THREADS="4"              # OMP threads used by STREAM (set to your CPU cores if desired)
-STREAM_TIME_LIMIT="2m"              # STREAM itself is quick; this is a safety cap
-STREAM_WORKDIR="./stream_build"     # where we compile/run STREAM if not available as a package
-STREAM_MIN_ARRAY_MB="1024"          # ensure arrays are big enough to exceed cache
-STREAM_MAX_ARRAY_MB_PERCENT="35"    # cap total STREAM arrays to % of MemAvailable (safety)
+# STREAM (classic benchmark)
+STREAM_OMP_THREADS="4"         # 1 DIMM => single-channel; threads still help saturate
+STREAM_TIME_LIMIT="2m"         # STREAM is usually quick; this is just a guard
+STREAM_WORKDIR="./stream_build"
+STREAM_MIN_ARRAY_MB="1024"     # arrays must exceed cache (at least ~1GB total footprint)
+STREAM_MAX_ARRAY_MB_PERCENT="35"  # cap total STREAM footprint to % of MemAvailable (safety)
 
 # GUI tools (optional)
 ENABLE_GUI_TOOLS="1"
@@ -74,6 +83,7 @@ fi
 # Helpers
 # ---------------------------
 require_root() {
+  # dmidecode + installs require root.
   if [[ "${EUID}" -ne 0 ]]; then
     echo "${C_RED}${C_BOLD}ERROR:${C_RESET} Please run as root. Example: sudo $0"
     exit 1
@@ -126,6 +136,7 @@ run_cmd() {
   info "Command: $*"
   echo
 
+  # Don't kill the whole script on one command failure
   set +e
   "$@"
   local rc=$?
@@ -167,6 +178,7 @@ launch_gui_app_background() {
 # Fedora / DNF helpers
 # ---------------------------
 dnf_install_if_missing() {
+  # Install packages only if not already installed.
   local pkgs=("$@")
   local to_install=()
 
@@ -188,6 +200,7 @@ dnf_install_if_missing() {
 }
 
 dnf_enable_rpmfusion_if_possible() {
+  # CPU-X is sometimes easier to get with RPM Fusion.
   banner "Fedora: Optional RPM Fusion enable (best effort)"
   info "Trying to enable RPM Fusion (free + nonfree) to improve tool availability..."
   echo
@@ -220,7 +233,8 @@ step0_install_packages() {
   info "Refreshing DNF metadata again..."
   dnf makecache -y || true
 
-  # Required CLI tools
+  # Core CLI tools (required)
+  # - curl/wget: used to download stream.c automatically if network is available
   local cli_pkgs=(
     stress-ng
     dmidecode
@@ -251,19 +265,6 @@ step0_install_packages() {
     dnf_install_if_missing "${p}"
     set -e
   done
-
-  # STREAM: try to install as a package if it exists; if not, we will compile later.
-  banner "Step 0A: STREAM availability check"
-  info "Trying: dnf install -y stream (may not exist in Fedora repos)"
-  set +e
-  dnf install -y stream
-  local stream_pkg_rc=$?
-  set -e
-  if [[ $stream_pkg_rc -eq 0 ]]; then
-    ok "Installed STREAM from repos (stream)."
-  else
-    warn "Package 'stream' not available in your repos. We'll compile STREAM from source automatically later."
-  fi
 
   echo
   ok "Installed versions (best effort):"
@@ -300,7 +301,7 @@ step0b_launch_gui_tools() {
 }
 
 # ---------------------------
-# Step 1A: Basic system identity
+# Step 1A: Basic identity
 # ---------------------------
 step1a_basic_identity() {
   banner "Step 1A: Basic CPU + Memory overview"
@@ -313,7 +314,7 @@ step1a_basic_identity() {
 # Step 1B: Slot-level DIMM validation
 # ---------------------------
 step1b_single_dimm_slot_validation() {
-  banner "Step 1B: Slot-level DIMM validation (prove 1x DIMM + size)"
+  banner "Step 1B: Slot-level DIMM validation (prove 1 DIMM + size hint)"
 
   local dmi
   dmi="$(find_cmd dmidecode)" || {
@@ -362,46 +363,58 @@ step1b_single_dimm_slot_validation() {
 
   cat "${tmp_out}"
 
-  local populated_count
+  local populated_count bad_size_count
   populated_count="$(grep -c '^SLOT_OK=1$' "${tmp_out}" 2>/dev/null || echo "0")"
+  bad_size_count="0"
+  if [[ "${populated_count}" -gt 0 ]]; then
+    bad_size_count="$(grep -E '^  Size:' "${tmp_out}" | grep -v " ${EXPECTED_DIMM_SIZE_GB} GB" | wc -l | tr -d ' ')"
+  fi
 
   echo
   info "Populated slot count detected: ${populated_count}"
+  info "Slots with unexpected size:   ${bad_size_count}"
   echo
 
   if [[ "${populated_count}" -ne "${EXPECTED_DIMM_COUNT}" ]]; then
     warn "Expected ${EXPECTED_DIMM_COUNT} populated slot(s), but detected ${populated_count}."
-    warn "If you are truly testing a single stick, this may indicate BIOS/board reporting oddities."
   else
     ok "Populated slot count matches expectation (${EXPECTED_DIMM_COUNT})."
   fi
 
-  rm -f "${tmp_out}"
+  if [[ "${bad_size_count}" -ne 0 ]]; then
+    warn "SMBIOS size does NOT match ${EXPECTED_DIMM_SIZE_GB} GB for at least one populated slot."
+    warn "Continue: Step 2 + Step 2B are the real proof of capacity."
+  else
+    ok "SMBIOS size matches ${EXPECTED_DIMM_SIZE_GB} GB for populated slot(s)."
+  fi
 
-  banner "Reminder"
-  echo "  • SMBIOS size reporting is helpful, but the REAL proof is:"
-  echo "    - stress-ng verify (Step 2)"
-  echo "    - memtester (Step 2B)"
+  rm -f "${tmp_out}"
 }
 
 # ---------------------------
-# Step 1C: More identity tools
+# Step 1C: Extra identity tools
 # ---------------------------
 step1c_identity_and_speed_tools() {
-  banner "Step 1C: Identity / speed tools (dmidecode, hwinfo, lshw)"
+  banner "Step 1C: Identity / speed tools (dmidecode highlights, hwinfo, lshw)"
 
   local dmi hwi lshw_bin
   if dmi="$(find_cmd dmidecode)"; then
     run_cmd "1C.1 dmidecode highlights" bash -lc \
       "${dmi} -t memory | grep -E 'Size:|Locator:|Manufacturer:|Part Number:|Serial Number:|Rank:|Data Width:|Total Width:|Configured Memory Speed|Speed:' || true" || true
+  else
+    warn "dmidecode not found."
   fi
 
   if hwi="$(find_cmd hwinfo)"; then
     run_cmd "1C.2 hwinfo --memory" "${hwi}" --memory || true
+  else
+    warn "hwinfo not found."
   fi
 
   if lshw_bin="$(find_cmd lshw)"; then
     run_cmd "1C.3 lshw -class memory" "${lshw_bin}" -class memory || true
+  else
+    warn "lshw not found."
   fi
 }
 
@@ -430,7 +443,7 @@ step2_stressng_verify() {
 # Step 2B: memtester (time-limited, percent-based)
 # ---------------------------
 step2b_memtester_random_fast() {
-  banner "Step 2B: Fast random address-space test (memtester, 85% MemAvailable)"
+  banner "Step 2B: Fast address-space test (memtester, % of MemAvailable, time-limited)"
 
   local memtester_bin
   memtester_bin="$(find_cmd memtester)" || {
@@ -440,12 +453,19 @@ step2b_memtester_random_fast() {
 
   local mem_avail_kb mem_avail_mb mem_to_test_mb
   mem_avail_kb="$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
+
+  if [[ -z "${mem_avail_kb}" || "${mem_avail_kb}" -le 0 ]]; then
+    warn "Could not read MemAvailable. Skipping memtester."
+    return 0
+  fi
+
   mem_avail_mb=$(( mem_avail_kb / 1024 ))
   mem_to_test_mb=$(( mem_avail_mb * MEMTESTER_PERCENT / 100 ))
 
-  # Safety bounds so it doesn't get silly on tiny/huge systems
+  # Safety bounds:
+  # - Minimum ensures the test is still meaningful.
+  # - Maximum keeps runtime in your 5–7 minute range on bigger RAM machines.
   if [[ "${mem_to_test_mb}" -lt 6144 ]]; then mem_to_test_mb=6144; fi
-  # cap to keep it around your 5–7 minute goal even on large RAM
   if [[ "${mem_to_test_mb}" -gt 26624 ]]; then mem_to_test_mb=26624; fi
 
   echo "MemAvailable: ${mem_avail_mb} MB"
@@ -464,12 +484,11 @@ step2b_memtester_random_fast() {
 }
 
 # ---------------------------
-# Step 3: STREAM benchmark (preferred over sysbench)
+# STREAM helpers (classic benchmark)
 # ---------------------------
-
 stream_download_stream_c() {
-  # Download STREAM.c from the official STREAM repo on GitHub.
-  # We do best-effort with curl/wget. If no network, user can manually place STREAM.c.
+  # Download the classic STREAM source file (stream.c).
+  # If your machine has no network, you can manually place stream.c in STREAM_WORKDIR.
   local url="https://raw.githubusercontent.com/jeffhammond/STREAM/master/stream.c"
   local out="$1"
 
@@ -481,112 +500,93 @@ stream_download_stream_c() {
     wget -qO "${out}" "${url}"
     return 0
   fi
-
   return 1
 }
 
 stream_compute_array_size() {
   # STREAM uses 3 arrays (a,b,c) of doubles by default.
-  # bytes_total ≈ 3 * N * 8  (ignoring minor overhead)
+  # Total bytes ~ 3 * N * 8 = 24*N.
   #
-  # We choose total bytes = min( MemAvailable * STREAM_MAX_ARRAY_MB_PERCENT%, cap ) but >= STREAM_MIN_ARRAY_MB.
-  local mem_avail_kb mem_avail_mb max_total_mb target_total_mb
+  # We choose a total footprint based on MemAvailable:
+  #   total_mb = max(STREAM_MIN_ARRAY_MB, MemAvailable * STREAM_MAX_ARRAY_MB_PERCENT%)
+  #
+  # Then N = total_bytes / 24.
+  local mem_avail_kb mem_avail_mb max_total_mb target_total_mb total_bytes n
+
   mem_avail_kb="$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
   mem_avail_mb=$(( mem_avail_kb / 1024 ))
 
   max_total_mb=$(( mem_avail_mb * STREAM_MAX_ARRAY_MB_PERCENT / 100 ))
-
-  # Ensure at least STREAM_MIN_ARRAY_MB total footprint for out-of-cache behavior
   target_total_mb="${max_total_mb}"
+
   if [[ "${target_total_mb}" -lt "${STREAM_MIN_ARRAY_MB}" ]]; then
     target_total_mb="${STREAM_MIN_ARRAY_MB}"
   fi
 
-  # Convert total MB to bytes, then solve for N:
-  # total_bytes = target_total_mb * 1024 * 1024
-  # N = total_bytes / (3 * 8)
-  local total_bytes n
   total_bytes=$(( target_total_mb * 1024 * 1024 ))
   n=$(( total_bytes / 24 ))
 
-  # STREAM requires N >= 1
   if [[ "${n}" -lt 1 ]]; then n=1; fi
-
   echo "${n}"
 }
 
+# ---------------------------
+# Step 3: STREAM benchmark (collision-proof)
+# ---------------------------
 step3_stream_bandwidth() {
-  banner "Step 3: STREAM benchmark (sustained memory bandwidth)"
-
-  # If a "stream" binary exists, try it first (some distros package it).
-  # If not, compile from source.
-  local stream_bin=""
-  if command -v stream >/dev/null 2>&1; then
-    stream_bin="$(command -v stream)"
-    ok "Found STREAM binary: ${stream_bin}"
-  fi
+  banner "Step 3: STREAM benchmark (classic Copy/Scale/Add/Triad) - collision-proof"
 
   mkdir -p "${STREAM_WORKDIR}"
+  local cfile="${STREAM_WORKDIR}/stream.c"
+  local outbin="${STREAM_WORKDIR}/stream_bench"
 
-  if [[ -z "${stream_bin}" ]]; then
-    info "No packaged STREAM binary detected. Compiling STREAM from source..."
-
-    local cfile="${STREAM_WORKDIR}/stream.c"
-    if [[ ! -f "${cfile}" ]]; then
-      info "Downloading STREAM source to: ${cfile}"
-      if ! stream_download_stream_c "${cfile}"; then
-        fail "Could not download STREAM.c (no curl/wget or no network)."
-        echo "Workaround:"
-        echo "  1) Download stream.c manually from the STREAM repo"
-        echo "  2) Place it here: ${cfile}"
-        echo "  3) Re-run the script"
-        return 0
-      fi
-    else
-      info "Using existing source: ${cfile}"
-    fi
-
-    local n
-    n="$(stream_compute_array_size)"
-
-    info "Computed STREAM_ARRAY_SIZE (N): ${n}"
-    info "OMP threads: ${STREAM_OMP_THREADS}"
-    echo
-
-    # Build:
-    # -O3: optimize
-    # -fopenmp: enable OpenMP (STREAM uses it)
-    # -DSTREAM_ARRAY_SIZE: force arrays big enough for out-of-cache bandwidth
-    # -mcmodel=large is sometimes needed for huge arrays; we keep arrays modest, so usually not needed
-    local outbin="${STREAM_WORKDIR}/stream"
-    run_cmd "3.1 Compile STREAM" gcc -O3 -fopenmp \
-      -DSTREAM_ARRAY_SIZE="${n}" \
-      -o "${outbin}" "${cfile}" || true
-
-    if [[ -x "${outbin}" ]]; then
-      stream_bin="${outbin}"
-      ok "STREAM compiled: ${stream_bin}"
-    else
-      fail "STREAM compile failed. Check compiler output above."
+  # Ensure we have stream.c
+  if [[ ! -f "${cfile}" ]]; then
+    info "Downloading classic STREAM source to: ${cfile}"
+    if ! stream_download_stream_c "${cfile}"; then
+      fail "Could not download STREAM.c (no curl/wget or no network)."
+      echo "Workaround (manual):"
+      echo "  1) Download stream.c from the STREAM GitHub repo on another machine"
+      echo "  2) Copy it to: ${cfile}"
+      echo "  3) Re-run the script"
       return 0
     fi
+  else
+    info "Using existing source: ${cfile}"
   fi
 
-  banner "Running STREAM"
-  echo "This reports sustainable memory bandwidth for Copy/Scale/Add/Triad kernels."
-  echo "OpenMP threads: ${STREAM_OMP_THREADS}"
-  echo "Time limit:     ${STREAM_TIME_LIMIT}"
+  # Compute a safe array size
+  local n
+  n="$(stream_compute_array_size)"
+
+  info "Computed STREAM_ARRAY_SIZE (N): ${n}"
+  info "OMP_NUM_THREADS: ${STREAM_OMP_THREADS}"
   echo
 
-  # Run STREAM with a safety timeout.
-  # Note: STREAM prints results; we keep output as-is for your log comparisons between DIMMs.
-  run_cmd "3.2 Run STREAM" bash -lc \
-    "export OMP_NUM_THREADS='${STREAM_OMP_THREADS}'; timeout '${STREAM_TIME_LIMIT}' '${stream_bin}'" || true
+  # Compile STREAM into a uniquely named local binary to avoid collisions with any "stream" command.
+  run_cmd "3.1 Compile STREAM benchmark (stream_bench)" gcc -O3 -fopenmp \
+    -DSTREAM_ARRAY_SIZE="${n}" \
+    -DNTIMES=10 \
+    -o "${outbin}" "${cfile}" || true
 
-  banner "Interpretation (what to look at)"
-  echo "  • Focus on the 'Triad' bandwidth (MB/s) as a common reference."
-  echo "  • Compare results between DIMMs: they should be close (±10–15%)."
-  echo "  • If XMP/EXPO is enabled, bandwidth should generally be higher."
+  if [[ ! -x "${outbin}" ]]; then
+    fail "STREAM compile failed. Check output above."
+    return 0
+  fi
+
+  banner "Running STREAM benchmark"
+  echo "Expected output includes: Copy / Scale / Add / Triad"
+  echo "OMP threads: ${STREAM_OMP_THREADS}"
+  echo "Time limit:  ${STREAM_TIME_LIMIT}"
+  echo
+
+  run_cmd "3.2 Run STREAM benchmark" bash -lc \
+    "export OMP_NUM_THREADS='${STREAM_OMP_THREADS}'; timeout '${STREAM_TIME_LIMIT}' '${outbin}'" || true
+
+  banner "Interpretation"
+  echo "  • Focus on the 'Triad' bandwidth (MB/s)."
+  echo "  • Compare DIMMs under the same BIOS settings; results should be close (±10–15%)."
+  echo "  • With only ONE DIMM installed, you should expect single-channel bandwidth."
 }
 
 final_summary() {
@@ -597,7 +597,7 @@ final_summary() {
   echo "  ✅ BUY if:"
   echo "     - stress-ng verify shows ZERO errors"
   echo "     - memtester shows ZERO errors"
-  echo "     - STREAM bandwidth looks consistent across DIMMs"
+  echo "     - STREAM output prints Copy/Scale/Add/Triad and looks consistent vs other DIMM"
   echo
   echo "  ❌ DON'T BUY if:"
   echo "     - Any stress-ng verify errors"
@@ -619,7 +619,11 @@ main() {
   echo
   echo "Expectations:"
   echo "  - Testing ONE DIMM at a time (expected populated slots: ${EXPECTED_DIMM_COUNT})"
-  echo "  - Expected DIMM size (SMBIOS hint): ${EXPECTED_DIMM_SIZE_GB} GB"
+  echo "  - Expected DIMM size hint (SMBIOS): ${EXPECTED_DIMM_SIZE_GB} GB"
+  echo
+  echo "Tip:"
+  echo "  - For a 16GB stick today: set EXPECTED_DIMM_SIZE_GB=\"16\" at top and rerun."
+  echo
   pause
 
   step0_install_packages
