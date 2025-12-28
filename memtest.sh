@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# RAM / CPU QUICK INSPECTION SCRIPT (Debian/Ubuntu Live USB)
-# Colored output + full logging + CLI tests + optional GUI launch (HardInfo, CPU-X)
+# RAM / CPU QUICK INSPECTION SCRIPT (Fedora Desktop 43 / Fedora Workstation)
 # ------------------------------------------------------------------------------
+# Goal:
+#   Verify a used RAM DIMM is "legit" (real capacity, stable, sane SPD fields),
+#   especially when testing ONE MODULE AT A TIME.
+#
 # What it does:
-#   0) Fix PATH to include /sbin and /usr/sbin
-#   1) Install required packages
-#   2) Launch GUI tools (optional) so you can visually inspect RAM info
-#   3) Collect identity/speed via CLI
-#   4) Stress test RAM capacity+stability (stress-ng --verify)
-#   5) Practical throughput test (sysbench memory)
-#   6) Pause between steps; log everything
+#   0) Logging + sanity checks
+#   1) Install required packages via DNF (best effort)
+#   2) Optional GUI launch (System Monitor, HardInfo, CPU-X) if available
+#   3) Slot-level DIMM verification (prove exactly one populated slot + 32 GB)
+#   4) Identity / speed / rank / width info (dmidecode, hwinfo, lshw, lscpu)
+#   5) Stability + verification test (stress-ng --verify)
+#   6) Address-space proof test (memtester)  <-- strong anti-fake test
+#   7) Practical throughput (sysbench memory)
 #
 # Usage:
-#   chmod +x ram_inspect.sh
-#   sudo ./ram_inspect.sh
+#   chmod +x ram_inspect_fedora43.sh
+#   sudo ./ram_inspect_fedora43.sh
 #
 # Notes:
-#   - GUI launch will work only if you are in a graphical session (DISPLAY set).
-#   - CPU-X may need extra permissions; we run it with sudo.
-#   - XMP/EXPO must be enabled in BIOS for DDR5-6000 speed.
+#   - dmidecode reads BIOS/SMBIOS. Some vendors omit serial/part fields; that’s normal.
+#   - The best counterfeit detection is: stress-ng verify + memtester passes.
+#   - On small-RAM systems, reduce VM_BYTES_PERCENT and MEMTESTER_PERCENT.
+#   - Running inside a VM tests virtual RAM behavior, not the physical DIMM.
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -27,22 +32,30 @@ set -Eeuo pipefail
 export PATH="/sbin:/usr/sbin:/bin:/usr/bin:$PATH"
 
 # ---------------------------
-# Configuration
+# Configuration (tune here)
 # ---------------------------
 
-# Step 2: stress-ng verify
-VM_WORKERS="2"
-VM_BYTES_PERCENT="90%"
-VERIFY_TIMEOUT="5m"
+# Expectation checks (for SINGLE DIMM testing)
+EXPECTED_DIMM_COUNT="1"       # you said you will test one module at a time
+EXPECTED_DIMM_SIZE_GB="32"    # each module should be 32 GB
 
-# Step 3: sysbench memory
+# stress-ng verify (stability / correctness)
+VM_WORKERS="2"
+VM_BYTES_PERCENT="85%"        # safer default than 90% for single-stick tests
+VERIFY_TIMEOUT="7m"           # increase to 10-20m for more confidence
+
+# memtester (address-space proof, anti-fake)
+MEMTESTER_PERCENT="85"        # percent of MemAvailable used by memtester
+MEMTESTER_PASSES="1"          # 1 pass is decent; 2-3 for high confidence
+
+# sysbench memory (throughput)
 SYSBENCH_THREADS="4"
 SYSBENCH_BLOCK_SIZE="1M"
-SYSBENCH_TOTAL_SIZE="512G"   # large so it runs longer (~tens of seconds to minutes)
+SYSBENCH_TOTAL_SIZE="512G"
 
 # GUI tools (optional)
-ENABLE_GUI_TOOLS="1"         # set to "0" to disable GUI launch
-GUI_LAUNCH_SLEEP_SEC="2"     # small delay between GUI launches
+ENABLE_GUI_TOOLS="1"
+GUI_LAUNCH_SLEEP_SEC="2"
 
 # Logging
 LOG_DIR="./ram_inspection_logs"
@@ -70,7 +83,9 @@ fi
 # ---------------------------
 # Helpers
 # ---------------------------
+
 require_root() {
+  # Many operations (dmidecode, installs) require root.
   if [[ "${EUID}" -ne 0 ]]; then
     echo "${C_RED}${C_BOLD}ERROR:${C_RESET} Please run as root. Example: sudo $0"
     exit 1
@@ -78,6 +93,7 @@ require_root() {
 }
 
 setup_logging() {
+  # Log everything to a file while still showing on screen.
   mkdir -p "${LOG_DIR}"
   LOG_FILE="${LOG_DIR}/${LOG_BASENAME}.log"
   exec > >(tee -i "${LOG_FILE}") 2>&1
@@ -100,8 +116,10 @@ banner() {
 info() { echo "${C_BLUE}${C_BOLD}[INFO]${C_RESET} $*"; }
 warn() { echo "${C_YELLOW}${C_BOLD}[WARN]${C_RESET} $*"; }
 ok()   { echo "${C_GREEN}${C_BOLD}[ OK ]${C_RESET} $*"; }
+fail() { echo "${C_RED}${C_BOLD}[FAIL]${C_RESET} $*"; }
 
 find_cmd() {
+  # Resolve a command path robustly.
   local cmd="$1"
   if command -v "${cmd}" >/dev/null 2>&1; then
     command -v "${cmd}"
@@ -117,6 +135,7 @@ find_cmd() {
 }
 
 run_cmd() {
+  # Run a command; do not crash script on failure (best effort).
   local title="$1"; shift
   banner "${title}"
   info "Command: $*"
@@ -137,13 +156,12 @@ run_cmd() {
 }
 
 is_gui_session() {
-  # Minimal check: in a live desktop session, DISPLAY is usually set.
-  # WAYLAND_DISPLAY may also be set. If neither exists, we assume no GUI.
+  # Wayland or X11 sessions typically set at least one of these.
   [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]
 }
 
 launch_gui_app_background() {
-  # Launch GUI tool in background if it exists; don't fail script if it doesn't.
+  # Launch a GUI app if possible; never fail if missing.
   local app="$1"
   local title="$2"
 
@@ -158,33 +176,113 @@ launch_gui_app_background() {
   fi
 
   info "Launching GUI: ${title} (${app})"
-  # Launch in background so script can continue.
-  # Redirect stdout/stderr so the script log doesn't get spammed by GUI noise.
   ( "${app}" >/dev/null 2>&1 & )
   sleep "${GUI_LAUNCH_SLEEP_SEC}"
 }
 
 # ---------------------------
-# Steps
+# Fedora / DNF helpers
+# ---------------------------
+
+dnf_install_if_missing() {
+  # Install packages only if not already installed.
+  local pkgs=("$@")
+  local to_install=()
+
+  for pkg in "${pkgs[@]}"; do
+    if rpm -q "${pkg}" >/dev/null 2>&1; then
+      info "Already installed: ${pkg}"
+    else
+      to_install+=("${pkg}")
+    fi
+  done
+
+  if [[ "${#to_install[@]}" -eq 0 ]]; then
+    ok "All requested packages already installed."
+    return 0
+  fi
+
+  info "Installing via dnf: ${to_install[*]}"
+  dnf install -y "${to_install[@]}"
+}
+
+dnf_enable_rpmfusion_if_possible() {
+  # Some optional tools may be present in RPM Fusion.
+  # We try to enable it; do not fail if offline.
+  banner "Fedora: Optional RPM Fusion enable (best effort)"
+  info "Trying to enable RPM Fusion (free + nonfree) to improve tool availability..."
+  echo
+
+  set +e
+  dnf install -y \
+    "https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm" \
+    "https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm"
+  local rc=$?
+  set -e
+
+  if [[ $rc -eq 0 ]]; then
+    ok "RPM Fusion enabled."
+  else
+    warn "RPM Fusion enable failed (offline? repo blocked?). Continuing without it."
+  fi
+}
+
+# ---------------------------
+# Step 0: Install packages
 # ---------------------------
 step0_install_packages() {
-  banner "Step 0: Install required packages"
-  info "Updating apt package lists..."
-  apt-get update -y
+  banner "Step 0: Install required packages (Fedora / DNF)"
 
-  info "Installing CLI tools: stress-ng dmidecode hwinfo lshw util-linux sysbench"
-  info "Installing GUI tools: hardinfo cpu-x gnome-system-monitor (best effort)"
-  apt-get install -y \
-    stress-ng dmidecode hwinfo lshw util-linux sysbench \
-    hardinfo cpu-x gnome-system-monitor || true
+  info "Refreshing DNF metadata..."
+  dnf makecache -y || true
+
+  # Optional repo enable for better odds of cpu-x/hardinfo availability.
+  dnf_enable_rpmfusion_if_possible
+
+  info "Refreshing DNF metadata again..."
+  dnf makecache -y || true
+
+  # Core CLI tools (required for meaningful testing)
+  local cli_pkgs=(
+    stress-ng
+    dmidecode
+    hwinfo
+    lshw
+    util-linux
+    sysbench
+    memtester
+  )
+
+  info "Installing CLI packages..."
+  set +e
+  dnf_install_if_missing "${cli_pkgs[@]}"
+  set -e
+
+  # Optional GUI tools (best effort)
+  local gui_pkgs=(
+    gnome-system-monitor
+    hardinfo
+    cpu-x
+  )
+
+  info "Installing GUI packages (best effort)..."
+  for p in "${gui_pkgs[@]}"; do
+    set +e
+    dnf_install_if_missing "${p}"
+    set -e
+  done
 
   echo
   ok "Installed versions (best effort):"
   echo "  stress-ng: $(stress-ng --version 2>/dev/null | head -n 1 || echo 'unknown')"
   echo "  dmidecode: $(dmidecode --version 2>/dev/null || echo 'unknown')"
+  echo "  memtester: $(memtester 2>/dev/null | head -n 1 || echo 'unknown')"
   echo "  sysbench:  $(sysbench --version 2>/dev/null || echo 'unknown')"
 }
 
+# ---------------------------
+# Step 0B: Launch GUI tools
+# ---------------------------
 step0b_launch_gui_tools() {
   banner "Step 0B: Launch GUI tools (optional)"
   if [[ "${ENABLE_GUI_TOOLS}" != "1" ]]; then
@@ -198,62 +296,181 @@ step0b_launch_gui_tools() {
   fi
 
   echo "Launching GUI tools to visually inspect RAM info:"
-  echo "  - GNOME System Monitor (watch RAM usage during stress tests)"
-  echo "  - HardInfo (hardware summary)"
-  echo "  - CPU-X (CPU-Z-like memory frequency/timings)"
+  echo "  - GNOME System Monitor (watch RAM usage during tests)"
+  echo "  - HardInfo (hardware summary) [may be unavailable]"
+  echo "  - CPU-X (CPU-Z-like memory frequency/timings) [may be unavailable]"
   echo
 
-  # System monitor first so you can keep it open while tests run
   launch_gui_app_background "gnome-system-monitor" "GNOME System Monitor"
   launch_gui_app_background "hardinfo" "HardInfo"
-  # CPU-X sometimes requires privileges to read low-level info; running as root is OK here.
   launch_gui_app_background "cpu-x" "CPU-X"
 
   ok "GUI tools launched (if available)."
-  echo "Tip: Keep System Monitor open during Step 2 to see RAM usage jump high."
 }
 
-step1_identity_and_speed() {
-  banner "Step 1: Identity / RAM configuration (includes configured speed)"
+# ---------------------------
+# Step 1A: Quick system identity
+# ---------------------------
+step1a_basic_identity() {
+  banner "Step 1A: Basic CPU + Memory overview"
 
-  run_cmd "1.1 CPU info (lscpu)" lscpu || true
+  run_cmd "1A.1 CPU info (lscpu)" lscpu || true
 
-  run_cmd "1.2 Memory totals (/proc/meminfo)" bash -lc \
-    "grep -E 'MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree' /proc/meminfo" || true
+  run_cmd "1A.2 Memory totals (/proc/meminfo)" bash -lc \
+    "grep -E 'MemTotal|MemAvailable|MemFree|SwapTotal|SwapFree' /proc/meminfo" || true
+}
+
+# ---------------------------
+# Step 1B: Slot-level DIMM validation (single-module proof)
+# ---------------------------
+step1b_single_dimm_slot_validation() {
+  banner "Step 1B: Slot-level DIMM validation (prove 1x ${EXPECTED_DIMM_SIZE_GB}GB)"
+
+  local dmi
+  dmi="$(find_cmd dmidecode)" || {
+    fail "dmidecode not found; cannot do slot-level validation."
+    return 0
+  }
+
+  # Parse dmidecode output:
+  # - Only keep populated "Memory Device" sections
+  # - Extract slot locator + size + manufacturer + part number + serial (if present)
+  #
+  # We also COUNT populated slots, and we CHECK size for each populated slot.
+  local populated_count="0"
+  local bad_size_count="0"
+
+  # Print a clean summary table-like output.
+  echo "Populated memory devices (from SMBIOS):"
+  echo "------------------------------------------------------------"
+
+  # We process dmidecode in awk, printing one block per populated slot.
+  # We also print markers we can count in bash.
+  local tmp_out
+  tmp_out="$(mktemp)"
+  "${dmi}" -t memory | awk '
+    BEGIN { in_dev=0; size=""; locator=""; bank=""; man=""; part=""; serial=""; rank=""; speed=""; confspeed=""; dataw=""; totalw=""; }
+    /^Memory Device$/ {
+      in_dev=1
+      size=""; locator=""; bank=""; man=""; part=""; serial=""
+      rank=""; speed=""; confspeed=""; dataw=""; totalw=""
+      next
+    }
+    in_dev && /^[ \t]*Size:/ { size=$2 " " $3 }
+    in_dev && /^[ \t]*Locator:/ { locator=$2 }
+    in_dev && /^[ \t]*Bank Locator:/ { bank=$3 }
+    in_dev && /^[ \t]*Manufacturer:/ { man=$2 }
+    in_dev && /^[ \t]*Part Number:/ { part=$0 }
+    in_dev && /^[ \t]*Serial Number:/ { serial=$3 }
+    in_dev && /^[ \t]*Rank:/ { rank=$2 }
+    in_dev && /^[ \t]*Speed:/ { speed=$2 " " $3 }
+    in_dev && /^[ \t]*Configured Memory Speed:/ { confspeed=$4 " " $5 }
+    in_dev && /^[ \t]*Data Width:/ { dataw=$3 " " $4 }
+    in_dev && /^[ \t]*Total Width:/ { totalw=$3 " " $4 }
+    in_dev && /^$/ {
+      if (size != "" && size != "No Module Installed") {
+        print "SLOT_OK=1"
+        print "Slot:", locator, "| Bank:", bank
+        print "  Size:", size
+        print "  Manufacturer:", man
+        if (serial != "" && serial != "Not") print "  Serial:", serial
+        if (rank != "") print "  Rank:", rank
+        if (dataw != "") print "  Data Width:", dataw
+        if (totalw != "") print "  Total Width:", totalw
+        if (speed != "") print "  Speed:", speed
+        if (confspeed != "") print "  Configured Speed:", confspeed
+        if (part != "") print " ", part
+        print "------------------------------------------------------------"
+      }
+      in_dev=0
+    }
+  ' > "${tmp_out}"
+
+  cat "${tmp_out}"
+
+  # Count populated slots by counting SLOT_OK markers.
+  populated_count="$(grep -c '^SLOT_OK=1$' "${tmp_out}" 2>/dev/null || echo "0")"
+
+  # Check for expected size string (e.g., "32 GB"). Note: dmidecode uses "GB" typically.
+  # We flag any populated slot not matching EXPECTED_DIMM_SIZE_GB.
+  # This is a "sanity check"; the REAL proof comes from stress-ng + memtester later.
+  if [[ "${populated_count}" -gt 0 ]]; then
+    # Count how many populated slots DO NOT contain "Size: 32 GB".
+    bad_size_count="$(grep -E '^  Size:' "${tmp_out}" | grep -v " ${EXPECTED_DIMM_SIZE_GB} GB" | wc -l | tr -d ' ')"
+  fi
+
+  rm -f "${tmp_out}"
+
+  echo
+  info "Populated slot count detected: ${populated_count}"
+  info "Slots with unexpected size:   ${bad_size_count}"
+  echo
+
+  if [[ "${populated_count}" -ne "${EXPECTED_DIMM_COUNT}" ]]; then
+    warn "Expected ${EXPECTED_DIMM_COUNT} populated slot(s), but detected ${populated_count}."
+    warn "If you are truly testing a single stick, this may indicate a BIOS/board reporting issue."
+  else
+    ok "Populated slot count matches expectation (${EXPECTED_DIMM_COUNT})."
+  fi
+
+  if [[ "${bad_size_count}" -ne 0 ]]; then
+    warn "At least one populated slot is NOT reporting ${EXPECTED_DIMM_SIZE_GB} GB in SMBIOS."
+    warn "Continue tests: stress-ng + memtester will prove real capacity."
+  else
+    ok "SMBIOS reports ${EXPECTED_DIMM_SIZE_GB} GB for populated slot(s)."
+  fi
+
+  banner "What you want to see (single-DIMM test)"
+  echo "  • EXACTLY 1 populated slot"
+  echo "  • Size: ${EXPECTED_DIMM_SIZE_GB} GB"
+  echo "  • Reasonable Manufacturer/Part Number (not always present)"
+  echo
+  warn "If SMBIOS fields are blank, that can still be normal. Real proof is Step 2 + Step 3."
+}
+
+# ---------------------------
+# Step 1C: Additional identity/speed tools
+# ---------------------------
+step1c_identity_and_speed_tools() {
+  banner "Step 1C: Identity / speed tools (dmidecode, hwinfo, lshw)"
 
   local dmi
   if dmi="$(find_cmd dmidecode)"; then
-    run_cmd "1.3 SMBIOS Memory (dmidecode -t memory)" "${dmi}" -t memory || true
-    run_cmd "1.4 Highlight RAM speed lines" bash -lc \
-      "${dmi} -t memory | grep -E 'Configured Memory Speed|Speed:' || true" || true
+    run_cmd "1C.1 dmidecode -t memory (full)" "${dmi}" -t memory || true
+    run_cmd "1C.2 Highlight key lines" bash -lc \
+      "${dmi} -t memory | grep -E 'Size:|Locator:|Manufacturer:|Part Number:|Serial Number:|Rank:|Data Width:|Total Width:|Configured Memory Speed|Speed:' || true" || true
   else
-    warn "dmidecode not found. Skipping dmidecode step."
+    warn "dmidecode not found. Skipping dmidecode."
   fi
 
   local hwi
   if hwi="$(find_cmd hwinfo)"; then
-    run_cmd "1.5 hwinfo memory summary" "${hwi}" --memory || true
+    run_cmd "1C.3 hwinfo --memory" "${hwi}" --memory || true
   else
-    warn "hwinfo not found. Skipping hwinfo step."
+    warn "hwinfo not found. Skipping hwinfo."
   fi
 
   local lshw_bin
   if lshw_bin="$(find_cmd lshw)"; then
-    run_cmd "1.6 lshw memory summary" "${lshw_bin}" -class memory || true
+    run_cmd "1C.4 lshw -class memory" "${lshw_bin}" -class memory || true
   else
-    warn "lshw not found. Skipping lshw step."
+    warn "lshw not found. Skipping lshw."
   fi
 
-  banner "What you should confirm now"
-  echo "  • Total RAM is ~64GB (MemTotal)."
-  echo "  • Two DIMMs are present (dmidecode/lshw)."
-  echo "  • Configured speed shows 6000 MT/s if XMP/EXPO enabled."
-  warn "Note: DDR5 serial/model may not always be exposed to software."
+  banner "Legit 32GB DIMM sanity hints"
+  echo "  • Rank: often 2 for 32GB UDIMM (not always shown)"
+  echo "  • Data Width: usually 64 bits (72 for ECC)"
+  echo "  • Configured speed reflects BIOS XMP/EXPO (e.g., 6000 MT/s)"
 }
 
-step2_capacity_and_stability() {
+# ---------------------------
+# Step 2: stress-ng verify (stability / correctness)
+# ---------------------------
+step2_stressng_verify() {
   banner "Step 2: Capacity + stability test (stress-ng --verify)"
-  echo "Allocates ~${VM_BYTES_PERCENT} of RAM, stresses patterns, and verifies correctness."
+
+  echo "This test allocates ~${VM_BYTES_PERCENT} of RAM and verifies memory patterns."
+  echo "Any verification errors are a strong 'DO NOT BUY' signal."
   echo
 
   run_cmd "2.1 stress-ng verify test" stress-ng \
@@ -264,55 +481,113 @@ step2_capacity_and_stability() {
     --timeout "${VERIFY_TIMEOUT}" \
     --metrics-brief || true
 
-  banner "How to interpret Step 2"
-  echo "  ✅ PASS: completes with no 'fail/error' lines."
-  echo "  ❌ FAIL: any verify errors, crashes, or reboots → do not buy."
+  banner "Interpretation"
+  echo "  ✅ PASS: completes with NO verify errors"
+  echo "  ❌ FAIL: verify errors, crash, reboot → do not buy"
 }
 
-step3_practical_speed_sysbench() {
-  banner "Step 3: Practical RAM speed test (sysbench memory)"
-  echo "This is a timed memory throughput test. It reports MiB/sec."
+# ---------------------------
+# Step 2B: memtester address-space proof (anti-fake)
+# ---------------------------
+step2b_memtester_address_check() {
+  banner "Step 2B: Address-space proof test (memtester)"
+
+  local memtester_bin
+  memtester_bin="$(find_cmd memtester)" || {
+    warn "memtester not found. Skipping Step 2B."
+    return 0
+  }
+
+  # Compute a safe amount of RAM in MB from MemAvailable:
+  # - MemAvailable is in kB
+  # - Convert to MB and multiply by MEMTESTER_PERCENT/100
+  local mem_avail_kb mem_to_test_mb
+  mem_avail_kb="$(awk '/MemAvailable/ {print $2}' /proc/meminfo)"
+  if [[ -z "${mem_avail_kb}" || "${mem_avail_kb}" -le 0 ]]; then
+    warn "Could not read MemAvailable from /proc/meminfo. Skipping memtester."
+    return 0
+  fi
+
+  mem_to_test_mb="$(( (mem_avail_kb / 1024) * MEMTESTER_PERCENT / 100 ))"
+
+  # Ensure we don't pass an absurdly small or zero value.
+  if [[ "${mem_to_test_mb}" -lt 256 ]]; then
+    warn "Computed memtester size is too small (${mem_to_test_mb} MB). Skipping."
+    return 0
+  fi
+
+  echo "This test is excellent at detecting counterfeit/mirrored RAM."
+  echo "Config:"
+  echo "  MemAvailable: ${mem_avail_kb} kB"
+  echo "  memtester MB: ${mem_to_test_mb} MB (~${MEMTESTER_PERCENT}% of MemAvailable)"
+  echo "  Passes:       ${MEMTESTER_PASSES}"
   echo
+
+  run_cmd "2B.1 memtester run" "${memtester_bin}" "${mem_to_test_mb}" "${MEMTESTER_PASSES}" || true
+
+  banner "Interpretation"
+  echo "  ✅ PASS: no errors"
+  echo "  ❌ FAIL: ANY error strongly suggests fake/defective memory"
+}
+
+# ---------------------------
+# Step 3: sysbench throughput
+# ---------------------------
+step3_sysbench_throughput() {
+  banner "Step 3: Practical RAM throughput (sysbench memory)"
+
+  local sysbench_bin
+  sysbench_bin="$(find_cmd sysbench)" || {
+    warn "sysbench not found. Skipping Step 3."
+    return 0
+  }
+
+  echo "Reports MiB/sec; useful for sanity-checking speed/channel/rank behavior."
   echo "Config:"
   echo "  Threads:   ${SYSBENCH_THREADS}"
   echo "  BlockSize: ${SYSBENCH_BLOCK_SIZE}"
   echo "  TotalSize: ${SYSBENCH_TOTAL_SIZE}"
   echo
 
-  run_cmd "3.1 sysbench memory WRITE throughput" sysbench memory \
+  run_cmd "3.1 sysbench WRITE throughput" "${sysbench_bin}" memory \
     --memory-block-size="${SYSBENCH_BLOCK_SIZE}" \
     --memory-total-size="${SYSBENCH_TOTAL_SIZE}" \
     --memory-oper=write \
     --threads="${SYSBENCH_THREADS}" \
     run || true
 
-  run_cmd "3.2 sysbench memory READ throughput" sysbench memory \
+  run_cmd "3.2 sysbench READ throughput" "${sysbench_bin}" memory \
     --memory-block-size="${SYSBENCH_BLOCK_SIZE}" \
     --memory-total-size="${SYSBENCH_TOTAL_SIZE}" \
     --memory-oper=read \
     --threads="${SYSBENCH_THREADS}" \
     run || true
 
-  banner "How to interpret Step 3"
-  echo "  - Look for MiB/sec lines (higher is better)."
-  echo "  - If XMP/EXPO is OFF, throughput will be lower."
-  echo "  - If single-channel, throughput will be much lower."
+  banner "Interpretation"
+  echo "  • Compare results between the two DIMMs; they should be similar."
+  echo "  • XMP/EXPO OFF will reduce throughput; enable in BIOS to confirm rated behavior."
 }
 
 final_summary() {
-  banner "Final Summary"
+  banner "Final Summary (Single-DIMM legitimacy check)"
+
   ok "Log file saved at: ${LOG_FILE}"
   echo
-  echo "${C_BOLD}Buy / Don't Buy quick rule:${C_RESET}"
-  echo "  ✅ BUY if:"
-  echo "     - Total RAM ~64GB"
-  echo "     - Step 2 stress-ng verify shows ZERO errors"
-  echo "     - Step 3 sysbench completes cleanly with reasonable MiB/sec"
+
+  echo "${C_BOLD}Your 'legit 32GB' decision rule:${C_RESET}"
+  echo "  ✅ BUY if ALL are true:"
+  echo "     - Step 1B shows exactly ${EXPECTED_DIMM_COUNT} populated slot(s)"
+  echo "     - SMBIOS size is ${EXPECTED_DIMM_SIZE_GB} GB (nice-to-have, not absolute)"
+  echo "     - Step 2 (stress-ng --verify) shows ZERO verification errors"
+  echo "     - Step 2B (memtester) shows ZERO errors"
+  echo "     - Step 3 (sysbench) is sane and consistent across both sticks"
   echo
-  echo "  ❌ DON'T BUY if:"
-  echo "     - Any stress-ng verification errors"
-  echo "     - System crashes/reboots during tests"
+  echo "  ❌ DON'T BUY if ANY are true:"
+  echo "     - stress-ng reports verify errors"
+  echo "     - memtester reports ANY error"
+  echo "     - system freezes/reboots during tests"
   echo
+
   echo "${C_DIM}View the full log anytime:${C_RESET}"
   echo "  less -R \"${LOG_FILE}\""
 }
@@ -321,9 +596,14 @@ main() {
   require_root
   setup_logging
 
-  banner "RAM Inspection Script - START"
+  banner "RAM Inspection Script - START (Fedora Desktop 43)"
   info "Date: $(date)"
+  info "Fedora release: $(rpm -E %fedora 2>/dev/null || echo 'unknown')"
   info "PATH: ${PATH}"
+  echo
+  echo "Expectation:"
+  echo "  - You are testing ONE DIMM at a time (expected populated slots: ${EXPECTED_DIMM_COUNT})"
+  echo "  - Each DIMM should be ${EXPECTED_DIMM_SIZE_GB} GB"
   pause
 
   step0_install_packages
@@ -332,13 +612,22 @@ main() {
   step0b_launch_gui_tools
   pause
 
-  step1_identity_and_speed
+  step1a_basic_identity
   pause
 
-  step2_capacity_and_stability
+  step1b_single_dimm_slot_validation
   pause
 
-  step3_practical_speed_sysbench
+  step1c_identity_and_speed_tools
+  pause
+
+  step2_stressng_verify
+  pause
+
+  step2b_memtester_address_check
+  pause
+
+  step3_sysbench_throughput
   pause
 
   final_summary
